@@ -16,7 +16,7 @@ class User(StrictModel):
     username: str = Field(min_length=1, max_length=32, pattern=r"^[a-zA-Z0-9_\.]+$")
     email: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=1, max_length=128)
-    permission_level: Optional[str] = Field(default="viewer", pattern=r"^(admin|uploader|viewer)$")
+    permission_level: Optional[str] = Field(default="user", pattern=r"^(admin|user)$")
     extra: Optional[Dict[str, Any]] = None
 
 
@@ -32,8 +32,7 @@ class UserUpdate(StrictModel):
     password: Optional[str] = Field(default=None)
     permission_level: Optional[str] = Field(default=None)
     extra: Optional[Dict[str, Any]] = None
-
-
+    
 
 # ---------- 认证 ----------
 class Token(StrictModel):
@@ -55,9 +54,10 @@ class DeviceCreate(StrictModel):
 
 
 class DeviceUpdate(StrictModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    sn: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    description: Optional[str] = Field(default=None, max_length=1000)
+    id: int
+    name: Optional[str] = Field(default=None)
+    sn: Optional[str] = Field(default=None)
+    description: Optional[str] = Field(default=None)
 
 
 class DeviceOut(StrictModel):
@@ -76,8 +76,9 @@ class OperationCreate(StrictModel):
 
 
 class OperationUpdate(StrictModel):
-    page_name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    action: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    id: int
+    page_name: Optional[str] = Field(default=None)
+    action: Optional[str] = Field(default=None)
 
 
 class OperationOut(StrictModel):

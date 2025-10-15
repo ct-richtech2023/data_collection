@@ -5,9 +5,7 @@ from common.database import Base, engine, get_db
 from common import models, schemas
 from .auth import hash_password, authenticate_user, create_access_token, get_current_user
 
-router = APIRouter(
-    tags=["user"],
-)
+router = APIRouter()
 
 @router.post("/auth/register")
 def register(user_in: schemas.User, db: Session = Depends(get_db)):
@@ -197,3 +195,325 @@ def delete_user(user_id: int,token: str = Header(..., description="JWT token"),d
     db.commit()
     
     return {"message": f"用户 {user.username} 已成功删除"}
+
+
+# ---------- 用户设备权限管理 ----------
+@router.post("/add_device_permission", response_model=schemas.UserDevicePermissionOut)
+def add_device_permission(
+    permission: schemas.UserDevicePermissionCreate,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """为用户添加设备权限 - 只有管理员可以添加设备权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以添加设备权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以添加设备权限"
+        )
+    
+    # 检查用户是否存在
+    user = db.query(models.User).filter(models.User.id == permission.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # 检查设备是否存在
+    device = db.query(models.Device).filter(models.Device.id == permission.device_id).first()
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="设备不存在"
+        )
+    
+    # 检查权限是否已存在
+    existing_permission = db.query(models.UserDevicePermission).filter(
+        models.UserDevicePermission.user_id == permission.user_id,
+        models.UserDevicePermission.device_id == permission.device_id
+    ).first()
+    if existing_permission:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该用户已拥有此设备权限"
+        )
+    
+    # 创建设备权限
+    db_permission = models.UserDevicePermission(
+        user_id=permission.user_id,
+        device_id=permission.device_id
+    )
+    db.add(db_permission)
+    db.commit()
+    db.refresh(db_permission)
+    return db_permission
+
+
+@router.get("/get_user_device_permissions", response_model=List[schemas.UserDevicePermissionOut])
+def get_user_device_permissions(
+    user_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取用户的设备权限列表 - 只有管理员可以查看用户设备权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看用户设备权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看用户设备权限"
+        )
+    
+    # 检查用户是否存在
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # 获取用户的设备权限
+    permissions = db.query(models.UserDevicePermission).filter(
+        models.UserDevicePermission.user_id == user_id
+    ).all()
+    return permissions
+
+
+@router.get("/get_device_user_permissions", response_model=List[schemas.UserDevicePermissionOut])
+def get_device_user_permissions(
+    device_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取设备的用户权限列表 - 只有管理员可以查看设备用户权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看设备用户权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看设备用户权限"
+        )
+    
+    # 检查设备是否存在
+    device = db.query(models.Device).filter(models.Device.id == device_id).first()
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="设备不存在"
+        )
+    
+    # 获取设备的用户权限
+    permissions = db.query(models.UserDevicePermission).filter(
+        models.UserDevicePermission.device_id == device_id
+    ).all()
+    return permissions
+
+
+@router.post("/remove_device_permission")
+def remove_device_permission(
+    user_id: int,
+    device_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """移除用户的设备权限 - 只有管理员可以移除设备权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以移除设备权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以移除设备权限"
+        )
+    
+    # 查找权限记录
+    permission = db.query(models.UserDevicePermission).filter(
+        models.UserDevicePermission.user_id == user_id,
+        models.UserDevicePermission.device_id == device_id
+    ).first()
+    
+    if not permission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="权限记录不存在"
+        )
+    
+    # 获取用户和设备信息用于返回消息
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    device = db.query(models.Device).filter(models.Device.id == device_id).first()
+    
+    # 删除权限记录
+    db.delete(permission)
+    db.commit()
+    
+    return {"message": f"已成功移除用户 {user.username if user else user_id} 对设备 {device.name if device else device_id} 的权限"}
+
+
+# ---------- 用户操作权限管理 ----------
+@router.post("/add_operation_permission", response_model=schemas.UserOperationPermissionOut)
+def add_operation_permission(
+    permission: schemas.UserOperationPermissionCreate,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """为用户添加操作权限 - 只有管理员可以添加操作权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以添加操作权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以添加操作权限"
+        )
+    
+    # 检查用户是否存在
+    user = db.query(models.User).filter(models.User.id == permission.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # 检查操作是否存在
+    operation = db.query(models.Operation).filter(models.Operation.id == permission.operation_id).first()
+    if not operation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="操作不存在"
+        )
+    
+    # 检查权限是否已存在
+    existing_permission = db.query(models.UserOperationPermission).filter(
+        models.UserOperationPermission.user_id == permission.user_id,
+        models.UserOperationPermission.operation_id == permission.operation_id
+    ).first()
+    if existing_permission:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该用户已拥有此操作权限"
+        )
+    
+    # 创建操作权限
+    db_permission = models.UserOperationPermission(
+        user_id=permission.user_id,
+        operation_id=permission.operation_id
+    )
+    db.add(db_permission)
+    db.commit()
+    db.refresh(db_permission)
+    return db_permission
+
+
+@router.get("/get_user_operation_permissions", response_model=List[schemas.UserOperationPermissionOut])
+def get_user_operation_permissions(
+    user_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取用户的操作权限列表 - 只有管理员可以查看用户操作权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看用户操作权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看用户操作权限"
+        )
+    
+    # 检查用户是否存在
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # 获取用户的操作权限
+    permissions = db.query(models.UserOperationPermission).filter(
+        models.UserOperationPermission.user_id == user_id
+    ).all()
+    return permissions
+
+
+@router.get("/get_operation_user_permissions", response_model=List[schemas.UserOperationPermissionOut])
+def get_operation_user_permissions(
+    operation_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取操作用户权限列表 - 只有管理员可以查看操作用户权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看操作用户权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看操作用户权限"
+        )
+    
+    # 检查操作是否存在
+    operation = db.query(models.Operation).filter(models.Operation.id == operation_id).first()
+    if not operation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="操作不存在"
+        )
+    
+    # 获取操作用户权限
+    permissions = db.query(models.UserOperationPermission).filter(
+        models.UserOperationPermission.operation_id == operation_id
+    ).all()
+    return permissions
+
+
+@router.post("/remove_operation_permission")
+def remove_operation_permission(
+    user_id: int,
+    operation_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """移除用户的操作权限 - 只有管理员可以移除操作权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以移除操作权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以移除操作权限"
+        )
+    
+    # 查找权限记录
+    permission = db.query(models.UserOperationPermission).filter(
+        models.UserOperationPermission.user_id == user_id,
+        models.UserOperationPermission.operation_id == operation_id
+    ).first()
+    
+    if not permission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="权限记录不存在"
+        )
+    
+    # 获取用户和操作信息用于返回消息
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    operation = db.query(models.Operation).filter(models.Operation.id == operation_id).first()
+    
+    # 删除权限记录
+    db.delete(permission)
+    db.commit()
+    
+    return {"message": f"已成功移除用户 {user.username if user else user_id} 对操作 {operation.page_name}.{operation.action if operation else operation_id} 的权限"}

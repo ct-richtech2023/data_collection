@@ -3,7 +3,8 @@ from fastapi import APIRouter
 from .user import router as user_router
 
 router = APIRouter(
-    prefix="/user"
+    prefix="/user",
+    tags=["user"]
 )
 
 # 包含子路由

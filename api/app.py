@@ -3,6 +3,8 @@ from fastapi import FastAPI, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from starlette.staticfiles import StaticFiles
 from router.user import router as user_router
+from router.device import router as device_router
+from router.operation import router as operation_router
 from static import SwaggerUIFileNames, SwaggerUIFiles
 
 app = FastAPI(
@@ -14,6 +16,8 @@ app.mount('/static', StaticFiles(directory=SwaggerUIFiles.current_dir), name='st
 
 # 挂载API
 app.include_router(user_router)
+app.include_router(device_router)
+app.include_router(operation_router)
 
 def get_custom_swagger_ui_html():
     return get_swagger_ui_html(
