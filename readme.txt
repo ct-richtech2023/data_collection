@@ -11,5 +11,25 @@ alembic upgrade head
 # 3. 查看当前迁移状态
 alembic current
 
+# 4. 查看数据库表列表（验证迁移结果）
+python3 -c "
+from api.common.database import engine
+from sqlalchemy import text
+with engine.connect() as conn:
+    result = conn.execute(text(\"\"\"
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        ORDER BY table_name
+    \"\"\"))
+    tables = [row[0] for row in result]
+    print('数据库表列表:')
+    for table in tables:
+        print(f'  - {table}')
+"
+
 # 启动应用
-uvicorn app.main:app --reload --host 0.0.0.0 --port 9000
+cd api && python3 app.py
+
+# 或者使用uvicorn启动
+cd api && uvicorn app:app --reload --host 0.0.0.0 --port 9000

@@ -6,8 +6,7 @@ from common import models, schemas
 from .auth import hash_password, authenticate_user, create_access_token, get_current_user
 
 router = APIRouter(
-    prefix="/system",
-    tags=["system"],
+    tags=["user"],
 )
 
 @router.post("/auth/register")

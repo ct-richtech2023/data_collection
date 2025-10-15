@@ -20,8 +20,8 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from app.database import Base
-from app import models  # 导入所有模型
+from api.common.database import Base
+from api.common import models  # 导入所有模型
 
 target_metadata = Base.metadata
 
