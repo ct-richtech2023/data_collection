@@ -144,6 +144,17 @@ with engine.connect() as conn:
 - `POST /user/update_user` - 更新用户信息（管理员）
 - `POST /user/delete_user` - 删除用户（管理员）
 
+### 权限管理
+
+- `POST /user/add_device_permission` - 添加设备权限（管理员）
+- `POST /user/add_operation_permission` - 添加操作权限（管理员）
+- `POST /user/add_user_permissions` - 批量添加设备权限和操作权限（管理员）
+- `GET /user/get_user_device_permissions` - 获取用户设备权限（管理员）
+- `GET /user/get_user_operation_permissions` - 获取用户操作权限（管理员）
+- `POST /user/get_users_with_permissions` - 获取所有用户及其权限信息，支持筛选（管理员）
+- `POST /user/remove_device_permission` - 移除设备权限（管理员）
+- `POST /user/remove_operation_permission` - 移除操作权限（管理员）
+
 ### 设备管理
 
 - `POST /device/create_device` - 创建设备
@@ -151,6 +162,213 @@ with engine.connect() as conn:
 - `POST /device/get_device_by_id` - 根据ID获取设备
 - `POST /device/update_device` - 更新设备信息
 - `POST /device/delete_device` - 删除设备
+
+## 批量权限管理 API
+
+### 新增接口：`POST /user/add_user_permissions`
+
+**功能**: 为用户同时添加设备权限和操作权限
+
+**权限要求**: 管理员权限
+
+**请求参数**:
+```json
+{
+  "user_id": 1,
+  "device_ids": [1, 2, 3],
+  "operation_ids": [1, 2, 3]
+}
+```
+
+**响应示例**:
+```json
+{
+  "message": "权限添加完成",
+  "user_id": 1,
+  "username": "testuser",
+  "added_device_permissions": 2,
+  "added_operation_permissions": 2,
+  "errors": [],
+  "details": {
+    "user_id": 1,
+    "device_permissions": [
+      {"device_id": 1, "device_name": "设备1"},
+      {"device_id": 2, "device_name": "设备2"}
+    ],
+    "operation_permissions": [
+      {"operation_id": 1, "operation_name": "页面1 - 查看"},
+      {"operation_id": 2, "operation_name": "页面2 - 编辑"}
+    ],
+    "errors": []
+  }
+}
+```
+
+**特性**:
+- ✅ 支持批量添加设备权限和操作权限
+- ✅ 自动检查权限是否已存在，避免重复
+- ✅ 详细的错误信息和成功统计
+- ✅ 事务安全，失败时自动回滚
+- ✅ 只有管理员可以操作
+
+### 新增接口：`POST /user/get_users_with_permissions`
+
+**功能**: 获取普通用户及其权限信息，支持按用户ID查询和分页 - 只返回user类型用户
+
+**权限要求**: 管理员权限
+
+**请求参数**:
+```json
+{
+  "user_id": 1,        // 可选，指定用户ID，为空则查询所有用户
+  "page": 1,           // 可选，页码，从1开始，默认1
+  "page_size": 10      // 可选，每页数量，默认10，最大100
+}
+```
+
+**参数说明**:
+- `user_id`: 指定用户ID，为空则查询所有用户
+- `page`: 页码，从1开始，默认1
+- `page_size`: 每页数量，默认10，最大100
+
+**响应示例**:
+```json
+{
+  "users": [
+    {
+      "user_id": 1,
+      "username": "admin",
+      "email": "admin@example.com",
+      "permission_level": "admin",
+      "create_time": "2024-01-01T00:00:00Z",
+      "update_time": "2024-01-01T00:00:00Z",
+      "device_permissions": [
+        {
+          "device_id": 1,
+          "device_name": "设备1",
+          "device_sn": "SN001",
+          "device_description": "设备描述",
+          "permission_id": 1,
+          "permission_create_time": "2024-01-01T00:00:00Z"
+        }
+      ],
+      "operation_permissions": [
+        {
+          "operation_id": 1,
+          "page_name": "用户管理",
+          "action": "查看",
+          "permission_id": 1,
+          "permission_create_time": "2024-01-01T00:00:00Z"
+        }
+      ],
+      "device_permission_count": 1,
+      "operation_permission_count": 1
+    }
+  ],
+  "pagination": {
+    "current_page": 1,
+    "page_size": 10,
+    "total_count": 1,
+    "total_pages": 1,
+    "has_next": false,
+    "has_prev": false
+  }
+}
+```
+
+**特性**:
+- ✅ 只返回user类型的普通用户（不包含admin用户）
+- ✅ 支持按用户ID查询（单个用户）
+- ✅ 支持查询所有普通用户
+- ✅ 支持分页功能（页码、每页数量）
+- ✅ 返回完整的用户信息（用户名、邮箱等）
+- ✅ 返回用户权限详情
+- ✅ 性能优化，减少数据库查询次数
+- ✅ 分页信息（总页数、是否有下一页等）
+- ✅ 只有管理员可以操作
+
+### 新增接口：`PUT /user/update_user_permissions`
+
+**功能**: 修改用户权限 - 只有管理员可以修改权限
+
+**权限要求**: 管理员权限
+
+**请求参数**:
+```json
+{
+  "user_id": 1,                    // 必填，用户ID
+  "device_ids": [1, 2, 3],         // 可选，设备ID列表，为空表示不修改设备权限
+  "operation_ids": [1, 2, 3]       // 可选，操作ID列表，为空表示不修改操作权限
+}
+```
+
+**参数说明**:
+- `user_id`: 必填，要修改权限的用户ID
+- `device_ids`: 可选，新的设备权限列表，为空表示不修改设备权限
+- `operation_ids`: 可选，新的操作权限列表，为空表示不修改操作权限
+
+**响应示例**:
+
+**成功修改权限**:
+```json
+{
+  "message": "权限修改完成",
+  "user_id": 1,
+  "username": "testuser",
+  "updated_device_permissions": 2,
+  "updated_operation_permissions": 3,
+  "errors": [],
+  "details": {
+    "user_id": 1,
+    "updated_device_permissions": [
+      {
+        "device_id": 1,
+        "device_name": "设备1"
+      },
+      {
+        "device_id": 2,
+        "device_name": "设备2"
+      }
+    ],
+    "updated_operation_permissions": [
+      {
+        "operation_id": 1,
+        "operation_name": "用户管理 - 查看"
+      },
+      {
+        "operation_id": 2,
+        "operation_name": "设备管理 - 查看"
+      },
+      {
+        "operation_id": 3,
+        "operation_name": "数据管理 - 查看"
+      }
+    ],
+    "errors": []
+  }
+}
+```
+
+**尝试修改管理员权限**:
+```json
+{
+  "message": "该账号是管理员，无需修改权限",
+  "user_id": 1,
+  "username": "admin",
+  "permission_level": "admin",
+  "note": "管理员拥有所有权限，无需单独设置设备权限和操作权限"
+}
+```
+
+**特性**:
+- ✅ 支持修改设备权限和操作权限
+- ✅ 支持只修改设备权限或只修改操作权限
+- ✅ 完全替换现有权限（删除旧权限，添加新权限）
+- ✅ 验证设备和操作是否存在
+- ✅ 管理员用户检查：尝试修改管理员权限时返回提示信息
+- ✅ 事务安全，失败时自动回滚
+- ✅ 详细的错误信息和修改结果
+- ✅ 只有管理员可以操作
 
 ## 数据库配置
 

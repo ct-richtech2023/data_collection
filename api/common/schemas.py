@@ -1,6 +1,6 @@
 # app/schemas.py
 from __future__ import annotations
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, List
 from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
@@ -210,3 +210,51 @@ class OperationLogOut(StrictModel):
     content: Optional[str] = None
     create_time: datetime
     update_time: datetime
+
+
+# ---------- 批量权限管理 ----------
+class UserPermissionsCreate(StrictModel):
+    user_id: int = Field(description="用户ID")
+    device_ids: Optional[List[int]] = Field(default=None, description="设备ID列表")
+    operation_ids: Optional[List[int]] = Field(default=None, description="操作ID列表")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": 1,
+                "device_ids": [1, 2, 3],
+                "operation_ids": [1, 2, 3]
+            }
+        }
+
+
+# ---------- 用户权限查询 ----------
+class UserPermissionsQuery(StrictModel):
+    user_id: Optional[int] = Field(default=None, description="用户ID，为空则查询所有用户")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": 1,
+                "page": 1,
+                "page_size": 10
+            }
+        }
+
+
+# ---------- 用户权限修改 ----------
+class UserPermissionsUpdate(StrictModel):
+    user_id: int = Field(description="用户ID")
+    device_ids: Optional[List[int]] = Field(default=None, description="设备ID列表，为空表示不修改设备权限")
+    operation_ids: Optional[List[int]] = Field(default=None, description="操作ID列表，为空表示不修改操作权限")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": 1,
+                "device_ids": [1, 2, 3],
+                "operation_ids": [1, 2, 3]
+            }
+        }

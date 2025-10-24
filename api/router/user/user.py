@@ -583,3 +583,359 @@ def remove_operation_permission(
     db.commit()
     
     return {"message": f"已成功移除用户 {user.username if user else user_id} 对操作 {operation.page_name}.{operation.action if operation else operation_id} 的权限"}
+
+
+@router.post("/add_user_permissions")
+def add_user_permissions(
+    permissions: schemas.UserPermissionsCreate,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """为用户同时添加设备权限和操作权限 - 只有管理员可以添加权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以添加权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以添加用户权限"
+        )
+    
+    # 检查用户是否存在
+    user = db.query(models.User).filter(models.User.id == permissions.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    results = {
+        "user_id": permissions.user_id,
+        "device_permissions": [],
+        "operation_permissions": [],
+        "errors": []
+    }
+    
+    try:
+        # 添加设备权限
+        if permissions.device_ids:
+            for device_id in permissions.device_ids:
+                # 检查设备是否存在
+                device = db.query(models.Device).filter(models.Device.id == device_id).first()
+                if not device:
+                    results["errors"].append(f"设备ID {device_id} 不存在")
+                    continue
+                
+                # 检查权限是否已存在
+                existing_permission = db.query(models.UserDevicePermission).filter(
+                    models.UserDevicePermission.user_id == permissions.user_id,
+                    models.UserDevicePermission.device_id == device_id
+                ).first()
+                
+                if existing_permission:
+                    results["errors"].append(f"用户已拥有设备ID {device_id} 的权限")
+                    continue
+                
+                # 创建设备权限
+                db_permission = models.UserDevicePermission(
+                    user_id=permissions.user_id,
+                    device_id=device_id
+                )
+                db.add(db_permission)
+                results["device_permissions"].append({
+                    "device_id": device_id,
+                    "device_name": device.name
+                })
+        
+        # 添加操作权限
+        if permissions.operation_ids:
+            for operation_id in permissions.operation_ids:
+                # 检查操作是否存在
+                operation = db.query(models.Operation).filter(models.Operation.id == operation_id).first()
+                if not operation:
+                    results["errors"].append(f"操作ID {operation_id} 不存在")
+                    continue
+                
+                # 检查权限是否已存在
+                existing_permission = db.query(models.UserOperationPermission).filter(
+                    models.UserOperationPermission.user_id == permissions.user_id,
+                    models.UserOperationPermission.operation_id == operation_id
+                ).first()
+                
+                if existing_permission:
+                    results["errors"].append(f"用户已拥有操作ID {operation_id} 的权限")
+                    continue
+                
+                # 创建操作权限
+                db_permission = models.UserOperationPermission(
+                    user_id=permissions.user_id,
+                    operation_id=operation_id
+                )
+                db.add(db_permission)
+                results["operation_permissions"].append({
+                    "operation_id": operation_id,
+                    "operation_name": f"{operation.page_name} - {operation.action}"
+                })
+        
+        # 提交所有更改
+        db.commit()
+        
+        return {
+            "message": "权限添加完成",
+            "user_id": permissions.user_id,
+            "username": user.username,
+            "added_device_permissions": len(results["device_permissions"]),
+            "added_operation_permissions": len(results["operation_permissions"]),
+            "errors": results["errors"],
+            "details": results
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"添加权限时发生错误: {str(e)}"
+        )
+
+
+@router.post("/get_users_with_permissions")
+def get_users_with_permissions(
+    request_data: schemas.UserPermissionsQuery,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取用户及其权限信息，支持按用户ID查询和分页 - 只有管理员可以查看"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看用户权限信息
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看用户权限信息"
+        )
+    
+    try:
+        # 构建查询 - 只查询user类型的用户
+        query = db.query(models.User).filter(models.User.permission_level == models.PermissionLevel.USER)
+        
+        # 如果指定了用户ID，则只查询该用户
+        if request_data.user_id:
+            query = query.filter(models.User.id == request_data.user_id)
+        
+        # 获取总数（用于分页信息）
+        total_count = query.count()
+        
+        # 应用分页
+        offset = (request_data.page - 1) * request_data.page_size
+        users = query.offset(offset).limit(request_data.page_size).all()
+        
+        # 构建设备和操作的映射字典（只获取用户权限相关的数据）
+        device_map = {}
+        operation_map = {}
+        
+        # 构建响应数据
+        result = []
+        for user in users:
+            # 获取用户设备权限
+            device_permissions = db.query(models.UserDevicePermission).filter(
+                models.UserDevicePermission.user_id == user.id
+            ).all()
+            
+            device_info = []
+            for perm in device_permissions:
+                # 如果设备信息不在映射中，则查询数据库
+                if perm.device_id not in device_map:
+                    device = db.query(models.Device).filter(models.Device.id == perm.device_id).first()
+                    if device:
+                        device_map[perm.device_id] = device
+                
+                device = device_map.get(perm.device_id)
+                if device:
+                    device_info.append({
+                        "device_id": device.id,
+                        "device_name": device.name,
+                        "device_sn": device.sn,
+                        "device_description": device.description,
+                        "permission_id": perm.id,
+                        "permission_create_time": perm.create_time
+                    })
+            
+            # 获取用户操作权限
+            operation_permissions = db.query(models.UserOperationPermission).filter(
+                models.UserOperationPermission.user_id == user.id
+            ).all()
+            
+            operation_info = []
+            for perm in operation_permissions:
+                # 如果操作信息不在映射中，则查询数据库
+                if perm.operation_id not in operation_map:
+                    operation = db.query(models.Operation).filter(models.Operation.id == perm.operation_id).first()
+                    if operation:
+                        operation_map[perm.operation_id] = operation
+                
+                operation = operation_map.get(perm.operation_id)
+                if operation:
+                    operation_info.append({
+                        "operation_id": operation.id,
+                        "page_name": operation.page_name,
+                        "action": operation.action,
+                        "permission_id": perm.id,
+                        "permission_create_time": perm.create_time
+                    })
+            
+            # 构建用户信息
+            user_data = {
+                "user_id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "permission_level": user.permission_level,
+                "create_time": user.create_time,
+                "update_time": user.update_time,
+                "device_permissions": device_info,
+                "operation_permissions": operation_info,
+                "device_permission_count": len(device_info),
+                "operation_permission_count": len(operation_info)
+            }
+            
+            result.append(user_data)
+        
+        # 计算分页信息
+        total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
+        
+        return {
+            "users": result,
+            "pagination": {
+                "current_page": request_data.page,
+                "page_size": request_data.page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_next": request_data.page < total_pages,
+                "has_prev": request_data.page > 1
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取用户权限信息时发生错误: {str(e)}"
+        )
+
+
+@router.post("/update_user_permissions")
+def update_user_permissions(
+    permissions: schemas.UserPermissionsUpdate,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """修改用户权限 - 只有管理员可以修改权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以修改权限
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以修改用户权限"
+        )
+    
+    # 检查用户是否存在
+    user = db.query(models.User).filter(models.User.id == permissions.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+    
+    # 检查是否为管理员用户
+    if user.permission_level == models.PermissionLevel.ADMIN:
+        return {
+            "message": "该账号是管理员，无需修改权限",
+            "user_id": permissions.user_id,
+            "username": user.username,
+            "permission_level": user.permission_level,
+            "note": "管理员拥有所有权限，无需单独设置设备权限和操作权限"
+        }
+    
+    results = {
+        "user_id": permissions.user_id,
+        "updated_device_permissions": [],
+        "updated_operation_permissions": [],
+        "errors": []
+    }
+    
+    try:
+        # 修改设备权限
+        if permissions.device_ids is not None:
+            # 删除用户现有的所有设备权限
+            db.query(models.UserDevicePermission).filter(
+                models.UserDevicePermission.user_id == permissions.user_id
+            ).delete()
+            
+            # 添加新的设备权限
+            for device_id in permissions.device_ids:
+                # 检查设备是否存在
+                device = db.query(models.Device).filter(models.Device.id == device_id).first()
+                if not device:
+                    results["errors"].append(f"设备ID {device_id} 不存在")
+                    continue
+                
+                # 创建设备权限
+                db_permission = models.UserDevicePermission(
+                    user_id=permissions.user_id,
+                    device_id=device_id
+                )
+                db.add(db_permission)
+                results["updated_device_permissions"].append({
+                    "device_id": device_id,
+                    "device_name": device.name
+                })
+        
+        # 修改操作权限
+        if permissions.operation_ids is not None:
+            # 删除用户现有的所有操作权限
+            db.query(models.UserOperationPermission).filter(
+                models.UserOperationPermission.user_id == permissions.user_id
+            ).delete()
+            
+            # 添加新的操作权限
+            for operation_id in permissions.operation_ids:
+                # 检查操作是否存在
+                operation = db.query(models.Operation).filter(models.Operation.id == operation_id).first()
+                if not operation:
+                    results["errors"].append(f"操作ID {operation_id} 不存在")
+                    continue
+                
+                # 创建操作权限
+                db_permission = models.UserOperationPermission(
+                    user_id=permissions.user_id,
+                    operation_id=operation_id
+                )
+                db.add(db_permission)
+                results["updated_operation_permissions"].append({
+                    "operation_id": operation_id,
+                    "operation_name": f"{operation.page_name} - {operation.action}"
+                })
+        
+        # 提交所有更改
+        db.commit()
+        
+        return {
+            "message": "权限修改完成",
+            "user_id": permissions.user_id,
+            "username": user.username,
+            "updated_device_permissions": len(results["updated_device_permissions"]),
+            "updated_operation_permissions": len(results["updated_operation_permissions"]),
+            "errors": results["errors"],
+            "details": results
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"修改权限时发生错误: {str(e)}"
+        )
+
+
