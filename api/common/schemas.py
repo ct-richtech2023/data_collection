@@ -95,6 +95,7 @@ class TaskCreate(StrictModel):
 
 
 class TaskUpdate(StrictModel):
+    id: int = Field(..., description="任务ID")
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
 
 
@@ -103,6 +104,21 @@ class TaskOut(StrictModel):
     name: str
     create_time: datetime
     update_time: datetime
+
+
+class TaskQuery(StrictModel):
+    task_id: Optional[int] = Field(default=None, description="任务ID，为空则查询所有任务")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "task_id": 1,
+                "page": 1,
+                "page_size": 10
+            }
+        }
 
 
 # ---------- 标签管理 ----------
