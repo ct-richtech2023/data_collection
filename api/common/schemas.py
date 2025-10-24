@@ -127,6 +127,7 @@ class LabelCreate(StrictModel):
 
 
 class LabelUpdate(StrictModel):
+    id: int = Field(..., description="标签ID")
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
 
 
@@ -135,6 +136,21 @@ class LabelOut(StrictModel):
     name: str
     create_time: datetime
     update_time: datetime
+
+
+class LabelQuery(StrictModel):
+    label_id: Optional[int] = Field(default=None, description="标签ID，为空则查询所有标签")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "label_id": 1,
+                "page": 1,
+                "page_size": 10
+            }
+        }
 
 
 # ---------- 用户设备权限管理 ----------
