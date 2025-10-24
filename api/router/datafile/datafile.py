@@ -1,8 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import uuid
+import zipfile
+import tempfile
 from datetime import datetime
 from mcap.reader import make_reader
 import io
@@ -372,6 +375,86 @@ def delete_datafile(
     db.delete(datafile)
     db.commit()
     return {"message": f"数据文件 {datafile.file_name} 已成功删除"}
+
+
+@router.post("/download_files_zip")
+def download_files_zip(
+    datafile_ids: List[int],
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """下载多个数据文件打包成ZIP - 只有管理员可以下载文件"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以下载文件
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以下载文件"
+        )
+    
+    if not datafile_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请提供要下载的文件ID列表"
+        )
+    
+    # 查找数据文件
+    datafiles = db.query(models.DataFile).filter(models.DataFile.id.in_(datafile_ids)).all()
+    if not datafiles:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="未找到任何数据文件"
+        )
+    
+    # 检查文件是否存在
+    missing_files = []
+    valid_files = []
+    for datafile in datafiles:
+        file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+        if os.path.exists(file_path):
+            valid_files.append((datafile, file_path))
+        else:
+            missing_files.append(datafile.file_name)
+    
+    if not valid_files:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="所有文件都不存在于服务器上"
+        )
+    
+    # 创建临时ZIP文件
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+    temp_file.close()
+    
+    try:
+        # 创建ZIP文件
+        with zipfile.ZipFile(temp_file.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for datafile, file_path in valid_files:
+                # 使用原始文件名作为ZIP内的文件名
+                zipf.write(file_path, datafile.file_name)
+        
+        # 生成ZIP文件名
+        zip_filename = f"datafiles_{len(valid_files)}_files.zip"
+        
+        # 返回ZIP文件
+        return FileResponse(
+            path=temp_file.name,
+            filename=zip_filename,
+            media_type='application/zip'
+        )
+        
+    except Exception as e:
+        # 清理临时文件
+        try:
+            os.unlink(temp_file.name)
+        except:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建ZIP文件时发生错误: {str(e)}"
+        )
 
 
 @router.post("/get_datafiles_with_pagination")
