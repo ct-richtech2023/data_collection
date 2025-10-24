@@ -248,6 +248,14 @@ def get_operations_with_pagination(
         if request_data.operation_id:
             query = query.filter(models.Operation.id == request_data.operation_id)
         
+        # 如果指定了页面名称，则进行模糊查询
+        if request_data.page_name:
+            query = query.filter(models.Operation.page_name.ilike(f"%{request_data.page_name}%"))
+        
+        # 如果指定了操作动作，则进行模糊查询
+        if request_data.action:
+            query = query.filter(models.Operation.action.ilike(f"%{request_data.action}%"))
+        
         # 获取总数（用于分页信息）
         total_count = query.count()
         

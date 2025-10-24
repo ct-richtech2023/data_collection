@@ -220,6 +220,10 @@ def get_labels_with_pagination(
         if request_data.label_id:
             query = query.filter(models.Label.id == request_data.label_id)
         
+        # 如果指定了标签名称，则进行模糊查询
+        if request_data.name:
+            query = query.filter(models.Label.name.ilike(f"%{request_data.name}%"))
+        
         # 获取总数（用于分页信息）
         total_count = query.count()
         

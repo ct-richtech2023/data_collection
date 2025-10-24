@@ -71,6 +71,8 @@ class DeviceOut(StrictModel):
 
 class DeviceQuery(StrictModel):
     device_id: Optional[int] = Field(default=None, description="设备ID，为空则查询所有设备")
+    name: Optional[str] = Field(default=None, description="设备名称，支持模糊查询")
+    sn: Optional[str] = Field(default=None, description="设备SN，支持模糊查询")
     page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
     page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
 
@@ -78,6 +80,8 @@ class DeviceQuery(StrictModel):
         json_schema_extra = {
             "example": {
                 "device_id": 1,
+                "name": "设备",
+                "sn": "SN123",
                 "page": 1,
                 "page_size": 10
             }
@@ -106,6 +110,8 @@ class OperationOut(StrictModel):
 
 class OperationQuery(StrictModel):
     operation_id: Optional[int] = Field(default=None, description="操作ID，为空则查询所有操作")
+    page_name: Optional[str] = Field(default=None, description="页面名称，支持模糊查询")
+    action: Optional[str] = Field(default=None, description="操作动作，支持模糊查询")
     page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
     page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
 
@@ -113,6 +119,8 @@ class OperationQuery(StrictModel):
         json_schema_extra = {
             "example": {
                 "operation_id": 1,
+                "page_name": "用户管理",
+                "action": "查看",
                 "page": 1,
                 "page_size": 10
             }
@@ -138,6 +146,7 @@ class TaskOut(StrictModel):
 
 class TaskQuery(StrictModel):
     task_id: Optional[int] = Field(default=None, description="任务ID，为空则查询所有任务")
+    name: Optional[str] = Field(default=None, description="任务名称，支持模糊查询")
     page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
     page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
 
@@ -145,6 +154,7 @@ class TaskQuery(StrictModel):
         json_schema_extra = {
             "example": {
                 "task_id": 1,
+                "name": "任务",
                 "page": 1,
                 "page_size": 10
             }
@@ -170,6 +180,7 @@ class LabelOut(StrictModel):
 
 class LabelQuery(StrictModel):
     label_id: Optional[int] = Field(default=None, description="标签ID，为空则查询所有标签")
+    name: Optional[str] = Field(default=None, description="标签名称，支持模糊查询")
     page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
     page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
 
@@ -177,6 +188,7 @@ class LabelQuery(StrictModel):
         json_schema_extra = {
             "example": {
                 "label_id": 1,
+                "name": "标签",
                 "page": 1,
                 "page_size": 10
             }

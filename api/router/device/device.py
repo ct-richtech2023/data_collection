@@ -243,6 +243,14 @@ def get_devices_with_pagination(
         if request_data.device_id:
             query = query.filter(models.Device.id == request_data.device_id)
         
+        # 如果指定了设备名称，则进行模糊查询
+        if request_data.name:
+            query = query.filter(models.Device.name.ilike(f"%{request_data.name}%"))
+        
+        # 如果指定了设备SN，则进行模糊查询
+        if request_data.sn:
+            query = query.filter(models.Device.sn.ilike(f"%{request_data.sn}%"))
+        
         # 获取总数（用于分页信息）
         total_count = query.count()
         

@@ -220,6 +220,10 @@ def get_tasks_with_pagination(
         if request_data.task_id:
             query = query.filter(models.Task.id == request_data.task_id)
         
+        # 如果指定了任务名称，则进行模糊查询
+        if request_data.name:
+            query = query.filter(models.Task.name.ilike(f"%{request_data.name}%"))
+        
         # 获取总数（用于分页信息）
         total_count = query.count()
         
