@@ -1,7 +1,7 @@
 # app/schemas.py
 from __future__ import annotations
 from typing import Any, Optional, Dict, List
-from datetime import datetime
+from datetime import datetime, date
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
@@ -222,12 +222,10 @@ class DataFileCreate(StrictModel):
 
 
 class DataFileUpdate(StrictModel):
-    task_id: Optional[int] = Field(default=None)
+    id: int = Field(..., description="数据文件ID")
     file_name: Optional[str] = Field(default=None, min_length=1, max_length=500)
-    download_url: Optional[str] = Field(default=None, min_length=1, max_length=1000)
-    duration_ms: Optional[int] = Field(default=None, ge=0)
-    user_id: Optional[int] = Field(default=None)
     device_id: Optional[int] = Field(default=None)
+    label_ids: Optional[List[int]] = Field(default=None, description="标签ID列表，可选")
 
 
 class DataFileOut(StrictModel):
@@ -240,6 +238,46 @@ class DataFileOut(StrictModel):
     device_id: int
     create_time: datetime
     update_time: datetime
+
+
+class DataFileUpload(StrictModel):
+    task_id: int = Field(..., description="任务ID")
+    device_id: int = Field(..., description="设备ID")
+    label_ids: Optional[List[int]] = Field(default=[], description="标签ID列表，可选")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "task_id": 1,
+                "device_id": 1,
+                "label_ids": [1, 2, 3]
+            }
+        }
+
+
+class DataFileQuery(StrictModel):
+    data_file_id: Optional[int] = Field(default=None, description="数据文件ID，为空则查询所有文件")
+    task_id: Optional[int] = Field(default=None, description="任务ID，为空则查询所有任务的文件")
+    user_id: Optional[int] = Field(default=None, description="用户ID，为空则查询所有用户的文件")
+    device_id: Optional[int] = Field(default=None, description="设备ID，为空则查询所有设备的文件")
+    start_date: Optional[date] = Field(default=None, description="开始日期，筛选创建日期大于等于此日期的文件")
+    end_date: Optional[date] = Field(default=None, description="结束日期，筛选创建日期小于等于此日期的文件")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "data_file_id": 1,
+                "task_id": 1,
+                "user_id": 1,
+                "device_id": 1,
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "page": 1,
+                "page_size": 10
+            }
+        }
 
 
 # ---------- 数据文件标签映射管理 ----------
