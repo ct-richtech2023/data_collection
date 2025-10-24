@@ -61,7 +61,7 @@ def get_all_devices(
             detail="只有管理员可以查看所有设备"
         )
     
-    devices = db.query(models.Device).all()
+    devices = db.query(models.Device).order_by(models.Device.id.asc()).all()
     return devices
 
 
@@ -216,3 +216,82 @@ def delete_device(
     db.delete(device)
     db.commit()
     return {"message": f"设备 {device.name} 已成功删除"}
+
+
+@router.post("/get_devices_with_pagination")
+def get_devices_with_pagination(
+    request_data: schemas.DeviceQuery,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取设备列表，支持分页和按ID查询 - 只有管理员可以查看"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看设备信息
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看设备信息"
+        )
+    
+    try:
+        # 构建查询
+        query = db.query(models.Device)
+        
+        # 如果指定了设备ID，则只查询该设备
+        if request_data.device_id:
+            query = query.filter(models.Device.id == request_data.device_id)
+        
+        # 获取总数（用于分页信息）
+        total_count = query.count()
+        
+        # 按ID正序排列
+        query = query.order_by(models.Device.id.asc())
+        
+        # 应用分页
+        offset = (request_data.page - 1) * request_data.page_size
+        devices = query.offset(offset).limit(request_data.page_size).all()
+        
+        # 构建响应数据
+        result = []
+        for device in devices:
+            # 获取设备关联的数据文件数量
+            data_files_count = db.query(models.DataFile).filter(models.DataFile.device_id == device.id).count()
+            
+            # 获取设备关联的用户权限数量
+            user_permissions_count = db.query(models.UserDevicePermission).filter(models.UserDevicePermission.device_id == device.id).count()
+            
+            device_data = {
+                "id": device.id,
+                "name": device.name,
+                "sn": device.sn,
+                "description": device.description,
+                "create_time": device.create_time,
+                "update_time": device.update_time,
+                "data_files_count": data_files_count,
+                "user_permissions_count": user_permissions_count
+            }
+            
+            result.append(device_data)
+        
+        # 计算分页信息
+        total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
+        
+        return {
+            "devices": result,
+            "pagination": {
+                "current_page": request_data.page,
+                "page_size": request_data.page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_next": request_data.page < total_pages,
+                "has_prev": request_data.page > 1
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取设备信息时发生错误: {str(e)}"
+        )

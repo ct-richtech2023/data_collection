@@ -63,7 +63,7 @@ def get_all_operations(
             detail="只有管理员可以查看所有操作"
         )
     
-    operations = db.query(models.Operation).all()
+    operations = db.query(models.Operation).order_by(models.Operation.id.asc()).all()
     return operations
 
 
@@ -221,3 +221,81 @@ def delete_operation(
     db.delete(operation)
     db.commit()
     return {"message": f"操作 {operation.page_name}.{operation.action} 已成功删除"}
+
+
+@router.post("/get_operations_with_pagination")
+def get_operations_with_pagination(
+    request_data: schemas.OperationQuery,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取操作列表，支持分页和按ID查询 - 只有管理员可以查看"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看操作信息
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看操作信息"
+        )
+    
+    try:
+        # 构建查询
+        query = db.query(models.Operation)
+        
+        # 如果指定了操作ID，则只查询该操作
+        if request_data.operation_id:
+            query = query.filter(models.Operation.id == request_data.operation_id)
+        
+        # 获取总数（用于分页信息）
+        total_count = query.count()
+        
+        # 按ID正序排列
+        query = query.order_by(models.Operation.id.asc())
+        
+        # 应用分页
+        offset = (request_data.page - 1) * request_data.page_size
+        operations = query.offset(offset).limit(request_data.page_size).all()
+        
+        # 构建响应数据
+        result = []
+        for operation in operations:
+            # 获取操作关联的用户权限数量
+            user_permissions_count = db.query(models.UserOperationPermission).filter(models.UserOperationPermission.operation_id == operation.id).count()
+            
+            # 获取操作关联的操作日志数量
+            operation_logs_count = db.query(models.OperationLog).filter(models.OperationLog.action == operation.action).count()
+            
+            operation_data = {
+                "id": operation.id,
+                "page_name": operation.page_name,
+                "action": operation.action,
+                "create_time": operation.create_time,
+                "update_time": operation.update_time,
+                "user_permissions_count": user_permissions_count,
+                "operation_logs_count": operation_logs_count
+            }
+            
+            result.append(operation_data)
+        
+        # 计算分页信息
+        total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
+        
+        return {
+            "operations": result,
+            "pagination": {
+                "current_page": request_data.page,
+                "page_size": request_data.page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_next": request_data.page < total_pages,
+                "has_prev": request_data.page > 1
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取操作信息时发生错误: {str(e)}"
+        )

@@ -69,6 +69,21 @@ class DeviceOut(StrictModel):
     update_time: datetime
 
 
+class DeviceQuery(StrictModel):
+    device_id: Optional[int] = Field(default=None, description="设备ID，为空则查询所有设备")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "device_id": 1,
+                "page": 1,
+                "page_size": 10
+            }
+        }
+
+
 # ---------- 操作管理 ----------
 class OperationCreate(StrictModel):
     page_name: str = Field(min_length=1, max_length=255)
@@ -87,6 +102,21 @@ class OperationOut(StrictModel):
     action: str
     create_time: datetime
     update_time: datetime
+
+
+class OperationQuery(StrictModel):
+    operation_id: Optional[int] = Field(default=None, description="操作ID，为空则查询所有操作")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "operation_id": 1,
+                "page": 1,
+                "page_size": 10
+            }
+        }
 
 
 # ---------- 任务管理 ----------
