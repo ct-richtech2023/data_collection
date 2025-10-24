@@ -40,6 +40,13 @@ def create_task(
     db.add(db_task)
     db.commit()
     db.refresh(db_task)
+    
+    # 记录任务创建日志
+    from common.operation_log_util import OperationLogUtil
+    OperationLogUtil.log_task_create(
+        db, current_user.username, task.name, db_task.id
+    )
+    
     return db_task
 
 
@@ -148,12 +155,23 @@ def update_task(
             )
     
     # 更新字段 - 只更新非None的字段
+    updated_fields = []
     for field, value in update_data.items():
         if value is not None:
             setattr(task, field, value)
+            updated_fields.append(field)
     
     db.commit()
     db.refresh(task)
+    
+    # 记录任务更新日志
+    if updated_fields:
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.create_log(
+            db, current_user.username, "任务更新", 
+            f"用户 {current_user.username} 更新了任务 {task.name}，更新字段: {', '.join(updated_fields)}"
+        )
+    
     return task
 
 
@@ -189,6 +207,12 @@ def delete_task(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"无法删除任务，该任务关联了 {data_files_count} 个数据文件"
         )
+    
+    # 记录任务删除日志
+    from common.operation_log_util import OperationLogUtil
+    OperationLogUtil.log_task_delete(
+        db, current_user.username, task.name, task_id
+    )
     
     db.delete(task)
     db.commit()

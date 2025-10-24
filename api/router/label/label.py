@@ -148,12 +148,23 @@ def update_label(
             )
     
     # 更新字段 - 只更新非None的字段
+    updated_fields = []
     for field, value in update_data.items():
         if value is not None:
             setattr(label, field, value)
+            updated_fields.append(field)
     
     db.commit()
     db.refresh(label)
+    
+    # 记录标签更新日志
+    if updated_fields:
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.create_log(
+            db, current_user.username, "标签更新", 
+            f"用户 {current_user.username} 更新了标签 {label.name}，更新字段: {', '.join(updated_fields)}"
+        )
+    
     return label
 
 
@@ -189,6 +200,13 @@ def delete_label(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"无法删除标签，该标签关联了 {data_file_labels_count} 个数据文件标签映射"
         )
+    
+    # 记录标签删除日志
+    from common.operation_log_util import OperationLogUtil
+    OperationLogUtil.create_log(
+        db, current_user.username, "标签删除", 
+        f"用户 {current_user.username} 删除了标签 {label.name}，标签ID: {label_id}"
+    )
     
     db.delete(label)
     db.commit()

@@ -164,6 +164,12 @@ async def upload_mcap_file(
                 db.add(db_datafile_label)
             db.commit()
         
+        # 创建文件上传操作日志
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.log_file_upload(
+            db, current_user.username, file.filename, db_datafile.id, task_id, device_id
+        )
+        
         return db_datafile
         
     except Exception as e:
@@ -321,12 +327,22 @@ def update_datafile(
         update_data.pop("label_ids", None)
     
     # 更新字段 - 只更新非None的字段
+    updated_fields = []
     for field, value in update_data.items():
         if value is not None:
             setattr(datafile, field, value)
+            updated_fields.append(field)
     
     db.commit()
     db.refresh(datafile)
+    
+    # 记录文件更新日志
+    if updated_fields:
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.log_file_update(
+            db, current_user.username, datafile.file_name, datafile_id, updated_fields
+        )
+    
     return datafile
 
 
@@ -355,13 +371,12 @@ def delete_datafile(
             detail="数据文件不存在"
         )
     
-    # 检查是否有数据文件标签映射关联此文件
+    # 删除关联的数据文件标签映射
     data_file_labels_count = db.query(models.DataFileLabel).filter(models.DataFileLabel.data_file_id == datafile_id).count()
     if data_file_labels_count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"无法删除数据文件，该文件关联了 {data_file_labels_count} 个标签映射"
-        )
+        # 删除所有关联的标签映射
+        db.query(models.DataFileLabel).filter(models.DataFileLabel.data_file_id == datafile_id).delete()
+        print(f"已删除 {data_file_labels_count} 个关联的标签映射")
     
     # 删除物理文件
     file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
@@ -372,9 +387,75 @@ def delete_datafile(
             # 记录错误但不阻止数据库删除
             print(f"删除物理文件失败: {e}")
     
+    # 记录文件删除日志
+    from common.operation_log_util import OperationLogUtil
+    OperationLogUtil.log_file_delete(
+        db, current_user.username, datafile.file_name, datafile_id
+    )
+    
     db.delete(datafile)
     db.commit()
     return {"message": f"数据文件 {datafile.file_name} 已成功删除"}
+
+
+@router.get("/download_file/{datafile_id}")
+def download_file(
+    datafile_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """下载单个数据文件 - 只有管理员可以下载文件"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以下载文件
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以下载文件"
+        )
+    
+    # 查找数据文件
+    datafile = db.query(models.DataFile).filter(models.DataFile.id == datafile_id).first()
+    if not datafile:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="数据文件不存在"
+        )
+    
+    # 构建文件路径
+    if datafile.download_url.startswith("/uploads/"):
+        file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+    else:
+        file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
+    
+    print(f"下载文件路径: {file_path}")  # 调试信息
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"文件不存在于服务器上: {file_path}"
+        )
+    
+    # 记录下载日志
+    from common.operation_log_util import OperationLogUtil
+    OperationLogUtil.log_file_download(
+        db, current_user.username, 1, [datafile_id]
+    )
+    
+    # 获取文件大小
+    file_size = os.path.getsize(file_path)
+    print(f"下载文件: {datafile.file_name}, 大小: {file_size} 字节")  # 调试信息
+    
+    return FileResponse(
+        path=file_path,
+        filename=datafile.file_name,
+        media_type='application/octet-stream',
+        headers={
+            "Content-Length": str(file_size),
+            "Cache-Control": "no-cache"
+        }
+    )
 
 
 @router.post("/download_files_zip")
@@ -411,12 +492,26 @@ def download_files_zip(
     # 检查文件是否存在
     missing_files = []
     valid_files = []
+    print(f"开始处理 {len(datafiles)} 个文件")  # 调试信息
+    
     for datafile in datafiles:
-        file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+        print(f"处理文件: {datafile.file_name}, URL: {datafile.download_url}")  # 调试信息
+        
+        # 处理文件路径，确保正确构建绝对路径
+        if datafile.download_url.startswith("/uploads/"):
+            file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+        else:
+            file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
+        
+        print(f"检查文件路径: {file_path}")  # 调试信息
+        print(f"文件是否存在: {os.path.exists(file_path)}")  # 调试信息
+        
         if os.path.exists(file_path):
             valid_files.append((datafile, file_path))
+            print(f"文件添加成功: {datafile.file_name}")  # 调试信息
         else:
             missing_files.append(datafile.file_name)
+            print(f"文件不存在: {file_path}")  # 调试信息
     
     if not valid_files:
         raise HTTPException(
@@ -424,37 +519,131 @@ def download_files_zip(
             detail="所有文件都不存在于服务器上"
         )
     
-    # 创建临时ZIP文件
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-    temp_file.close()
+    # 创建ZIP文件在内存中
+    import io
     
     try:
-        # 创建ZIP文件
-        with zipfile.ZipFile(temp_file.name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        print(f"开始创建ZIP文件，包含 {len(valid_files)} 个文件")  # 调试信息
+        
+        # 创建内存中的ZIP文件
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for datafile, file_path in valid_files:
+                print(f"添加文件到ZIP: {datafile.file_name} -> {file_path}")  # 调试信息
                 # 使用原始文件名作为ZIP内的文件名
                 zipf.write(file_path, datafile.file_name)
+        
+        # 获取ZIP文件大小
+        zip_size = zip_buffer.tell()
+        print(f"ZIP文件创建完成，大小: {zip_size} 字节")  # 调试信息
+        
+        if zip_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="ZIP文件创建失败，文件大小为0"
+            )
         
         # 生成ZIP文件名
         zip_filename = f"datafiles_{len(valid_files)}_files.zip"
         
+        # 创建文件下载操作日志
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.log_file_download(
+            db, current_user.username, len(valid_files), datafile_ids
+        )
+        
+        # 改进的生成器函数，分块读取数据
+        def generate_zip():
+            zip_buffer.seek(0)  # 确保读取位置是从头开始
+            chunk_size = 1024 * 1024  # 1MB chunks
+            while True:
+                chunk = zip_buffer.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        
+        print(f"准备返回ZIP文件，大小: {zip_size} 字节，文件名: {zip_filename}")  # 调试信息
+        
         # 返回ZIP文件
-        return FileResponse(
-            path=temp_file.name,
-            filename=zip_filename,
-            media_type='application/zip'
+        return StreamingResponse(
+            generate_zip(),
+            media_type='application/zip',
+            headers={
+                "Content-Disposition": f"attachment; filename={zip_filename}",
+                "Content-Length": str(zip_size),
+                "Cache-Control": "no-cache"
+            }
         )
         
     except Exception as e:
-        # 清理临时文件
-        try:
-            os.unlink(temp_file.name)
-        except:
-            pass
+        print(f"创建ZIP文件时发生错误: {str(e)}")  # 详细错误日志
+        import traceback
+        print(f"错误堆栈: {traceback.format_exc()}")  # 完整错误堆栈
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"创建ZIP文件时发生错误: {str(e)}"
         )
+
+
+@router.get("/test_download")
+def test_download():
+    """测试下载功能 - 返回一个简单的文本文件"""
+    test_content = "这是一个测试文件\n测试下载功能是否正常工作\n时间: " + str(datetime.now())
+    
+    # 使用内存方式返回文件
+    import io
+    
+    def generate_text():
+        yield test_content.encode('utf-8')
+    
+    return StreamingResponse(
+        generate_text(),
+        media_type='text/plain',
+        headers={"Content-Disposition": "attachment; filename=test_download.txt"}
+    )
+
+
+@router.get("/test_zip_download")
+def test_zip_download():
+    """测试ZIP下载功能 - 创建一个简单的ZIP文件"""
+    import io
+    import zipfile
+    
+    # 创建测试内容
+    test_content = "这是一个测试文件\n测试ZIP下载功能\n时间: " + str(datetime.now())
+    
+    # 创建内存中的ZIP文件
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # 添加文本文件到ZIP
+        zipf.writestr("test_file.txt", test_content)
+        zipf.writestr("another_file.txt", "另一个测试文件\n内容很简单")
+    
+    # 获取ZIP文件大小
+    zip_size = zip_buffer.tell()
+    print(f"测试ZIP文件大小: {zip_size} 字节")  # 调试信息
+    
+    # 改进的生成器函数
+    def generate_zip():
+        zip_buffer.seek(0)
+        chunk_size = 1024 * 1024  # 1MB chunks
+        while True:
+            chunk = zip_buffer.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    
+    return StreamingResponse(
+        generate_zip(),
+        media_type='application/zip',
+        headers={
+            "Content-Disposition": "attachment; filename=test_download.zip",
+            "Content-Length": str(zip_size),
+            "Cache-Control": "no-cache"
+        }
+    )
 
 
 @router.post("/get_datafiles_with_pagination")

@@ -40,6 +40,13 @@ def register(user_in: schemas.User, token: str = Header(..., description="JWT to
         db.add(user)
         db.commit()
         db.refresh(user)
+        
+        # 创建用户注册操作日志
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.log_user_register(
+            db, current_user.username, user_in.username, user_in.permission_level
+        )
+        
         return user
     except Exception as e:
         # 发生错误时回滚事务
@@ -70,6 +77,11 @@ def login(login_data: schemas.UserLogin, db: Session = Depends(get_db)):
     user = authenticate_user(db, username=login_data.username, password=login_data.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
+    
+    # 创建登录操作日志
+    from common.operation_log_util import OperationLogUtil
+    OperationLogUtil.log_user_login(db, user.username)
+    
     token = create_access_token({"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
 

@@ -292,6 +292,59 @@ class DataFileQuery(StrictModel):
         }
 
 
+# ---------- 操作日志管理 ----------
+class OperationLogCreate(StrictModel):
+    username: str = Field(..., min_length=1, max_length=255, description="操作人用户名")
+    action: str = Field(..., min_length=1, max_length=255, description="操作类型")
+    data_file_id: Optional[int] = Field(default=None, description="关联数据文件ID，可选")
+    content: Optional[str] = Field(default=None, description="操作内容描述")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "username": "admin",
+                "action": "下载文件",
+                "data_file_id": 1,
+                "content": "下载了文件 example.mcap"
+            }
+        }
+
+
+class OperationLogOut(StrictModel):
+    id: int
+    username: str
+    action: str
+    data_file_id: Optional[int]
+    content: Optional[str]
+    create_time: datetime
+    update_time: datetime
+
+
+class OperationLogQuery(StrictModel):
+    log_id: Optional[int] = Field(default=None, description="日志ID，为空则查询所有日志")
+    username: Optional[str] = Field(default=None, description="用户名，支持模糊查询")
+    action: Optional[str] = Field(default=None, description="操作类型，支持模糊查询")
+    data_file_id: Optional[int] = Field(default=None, description="数据文件ID，为空则查询所有文件相关的日志")
+    start_date: Optional[date] = Field(default=None, description="开始日期，筛选创建日期大于等于此日期的日志")
+    end_date: Optional[date] = Field(default=None, description="结束日期，筛选创建日期小于等于此日期的日志")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "log_id": 1,
+                "username": "admin",
+                "action": "下载",
+                "data_file_id": 1,
+                "start_date": "2024-01-01",
+                "end_date": "2024-12-31",
+                "page": 1,
+                "page_size": 10
+            }
+        }
+
+
 # ---------- 数据文件标签映射管理 ----------
 class DataFileLabelCreate(StrictModel):
     data_file_id: int

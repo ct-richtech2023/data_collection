@@ -1,0 +1,222 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Header
+from sqlalchemy.orm import Session
+from typing import List
+from datetime import datetime, date
+from common.database import get_db
+from common import models, schemas
+from router.user.auth import get_current_user
+
+router = APIRouter()
+
+
+@router.post("/create_log", response_model=schemas.OperationLogOut)
+def create_operation_log(
+    log_data: schemas.OperationLogCreate,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """创建操作日志 - 只有管理员可以创建日志"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以创建日志
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以创建操作日志"
+        )
+    
+    # 如果指定了数据文件ID，验证文件是否存在
+    if log_data.data_file_id:
+        datafile = db.query(models.DataFile).filter(models.DataFile.id == log_data.data_file_id).first()
+        if not datafile:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="指定的数据文件不存在"
+            )
+    
+    try:
+        # 创建操作日志
+        db_log = models.OperationLog(
+            username=log_data.username,
+            action=log_data.action,
+            data_file_id=log_data.data_file_id,
+            content=log_data.content
+        )
+        db.add(db_log)
+        db.commit()
+        db.refresh(db_log)
+        
+        return db_log
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建操作日志时发生错误: {str(e)}"
+        )
+
+
+@router.get("/get_all_logs", response_model=List[schemas.OperationLogOut])
+def get_all_operation_logs(
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取所有操作日志 - 只有管理员可以查看所有日志"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看所有日志
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看所有日志"
+        )
+    
+    logs = db.query(models.OperationLog).order_by(models.OperationLog.id.asc()).all()
+    return logs
+
+
+@router.get("/get_log_by_id", response_model=schemas.OperationLogOut)
+def get_operation_log_by_id(
+    log_id: int,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """根据ID获取操作日志信息 - 只有管理员可以查看日志信息"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看日志信息
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看日志信息"
+        )
+    
+    log = db.query(models.OperationLog).filter(models.OperationLog.id == log_id).first()
+    if not log:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="操作日志不存在"
+        )
+    return log
+
+
+@router.post("/get_logs_with_pagination")
+def get_operation_logs_with_pagination(
+    request_data: schemas.OperationLogQuery,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取操作日志列表，支持分页和多条件查询 - 只有管理员可以查看"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看日志信息
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看日志信息"
+        )
+    
+    try:
+        # 构建查询
+        query = db.query(models.OperationLog)
+        
+        # 如果指定了日志ID，则只查询该日志
+        if request_data.log_id:
+            query = query.filter(models.OperationLog.id == request_data.log_id)
+        
+        # 如果指定了用户名，则进行模糊查询
+        if request_data.username:
+            query = query.filter(models.OperationLog.username.ilike(f"%{request_data.username}%"))
+        
+        # 如果指定了操作类型，则进行模糊查询
+        if request_data.action:
+            query = query.filter(models.OperationLog.action.ilike(f"%{request_data.action}%"))
+        
+        # 如果指定了数据文件ID，则只查询该文件相关的日志
+        if request_data.data_file_id:
+            query = query.filter(models.OperationLog.data_file_id == request_data.data_file_id)
+        
+        # 日期筛选
+        if request_data.start_date:
+            # 开始日期：筛选创建日期大于等于此日期的日志（从当天00:00:00开始）
+            start_datetime = datetime.combine(request_data.start_date, datetime.min.time())
+            query = query.filter(models.OperationLog.create_time >= start_datetime)
+        
+        if request_data.end_date:
+            # 结束日期：筛选创建日期小于等于此日期的日志（到当天23:59:59结束）
+            end_datetime = datetime.combine(request_data.end_date, datetime.max.time().replace(microsecond=0))
+            query = query.filter(models.OperationLog.create_time <= end_datetime)
+        
+        # 获取总数（用于分页信息）
+        total_count = query.count()
+        
+        # 按ID正序排列
+        query = query.order_by(models.OperationLog.id.asc())
+        
+        # 应用分页
+        offset = (request_data.page - 1) * request_data.page_size
+        logs = query.offset(offset).limit(request_data.page_size).all()
+        
+        # 构建响应数据
+        result = []
+        for log in logs:
+            # 获取关联的数据文件信息（如果存在）
+            datafile_info = None
+            if log.data_file_id:
+                datafile = db.query(models.DataFile).filter(models.DataFile.id == log.data_file_id).first()
+                if datafile:
+                    # 获取关联的任务信息
+                    task = db.query(models.Task).filter(models.Task.id == datafile.task_id).first()
+                    task_name = task.name if task else "未知任务"
+                    
+                    # 获取关联的设备信息
+                    device = db.query(models.Device).filter(models.Device.id == datafile.device_id).first()
+                    device_name = device.name if device else "未知设备"
+                    
+                    datafile_info = {
+                        "data_file_id": datafile.id,
+                        "file_name": datafile.file_name,
+                        "task_id": datafile.task_id,
+                        "task_name": task_name,
+                        "device_id": datafile.device_id,
+                        "device_name": device_name,
+                        "create_time": datafile.create_time
+                    }
+            
+            log_data = {
+                "id": log.id,
+                "username": log.username,
+                "action": log.action,
+                "data_file_id": log.data_file_id,
+                "content": log.content,
+                "create_time": log.create_time,
+                "update_time": log.update_time,
+                "datafile_info": datafile_info
+            }
+            
+            result.append(log_data)
+        
+        # 计算分页信息
+        total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
+        
+        return {
+            "logs": result,
+            "pagination": {
+                "current_page": request_data.page,
+                "page_size": request_data.page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_next": request_data.page < total_pages,
+                "has_prev": request_data.page > 1
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取操作日志信息时发生错误: {str(e)}"
+        )

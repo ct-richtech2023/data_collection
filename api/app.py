@@ -8,6 +8,7 @@ from router.operation import router as operation_router
 from router.task import router as task_router
 from router.label import router as label_router
 from router.datafile import router as datafile_router
+from router.operationlog import router as operationlog_router
 from static import SwaggerUIFileNames, SwaggerUIFiles
 
 app = FastAPI(
@@ -24,6 +25,7 @@ app.include_router(task_router)
 app.include_router(label_router)
 app.include_router(device_router)
 app.include_router(operation_router)
+app.include_router(operationlog_router)
 app.include_router(user_router)
 
 def get_custom_swagger_ui_html():
