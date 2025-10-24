@@ -1,3 +1,4 @@
+from loguru import logger
 from fastapi import FastAPI, Depends, HTTPException, status, Header, APIRouter
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -8,27 +9,59 @@ from .auth import hash_password, authenticate_user, create_access_token, get_cur
 router = APIRouter()
 
 @router.post("/auth/register")
-def register(user_in: schemas.User, db: Session = Depends(get_db)):
-    exists = db.query(models.User).filter(models.User.username == user_in.username).first()
-    if exists:
-        raise HTTPException(status_code=400, detail="Username already registered")
+def register(user_in: schemas.User, token: str = Header(..., description="JWT token"), db: Session = Depends(get_db)):
+    """用户注册 - 只有管理员可以注册新用户"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以注册新用户
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以注册新用户"
+        )
     
     # 检查用户名是否已存在
     username_exists = db.query(models.User).filter(models.User.username == user_in.username).first()
     if username_exists:
-        raise HTTPException(status_code=400, detail="Username already taken")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="用户名已存在，请使用其他用户名"
+        )
     
-    user = models.User(
-        email=user_in.email,
-        username=user_in.username,
-        password=hash_password(user_in.password),
-        permission_level=user_in.permission_level,
-        extra=user_in.extra,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
+    try:
+        user = models.User(
+            email=user_in.email,
+            username=user_in.username,
+            password=hash_password(user_in.password),
+            permission_level=user_in.permission_level,
+            extra=user_in.extra,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+    except Exception as e:
+        # 发生错误时回滚事务
+        db.rollback()
+        # 如果是数据库完整性错误，提供更友好的错误信息
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            if "username" in str(e):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="用户名已存在，请使用其他用户名"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="数据冲突，请检查输入信息"
+                )
+        else:
+            # 其他数据库错误
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="注册用户时发生错误，请稍后重试"
+            )
 
 
 @router.post("/auth/login")
@@ -135,6 +168,16 @@ def update_user(user_update: schemas.UserUpdate, token: str = Header(..., descri
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="用户名只能包含字母、数字、下划线和点"
             )
+        # 检查用户名唯一性（排除当前用户）
+        existing_user = db.query(models.User).filter(
+            models.User.username == update_data["username"],
+            models.User.id != user_id
+        ).first()
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="用户名已存在"
+            )
     
     if "email" in update_data and update_data["email"] is not None:
         if len(update_data["email"]) < 1 or len(update_data["email"]) > 255:
@@ -153,20 +196,43 @@ def update_user(user_update: schemas.UserUpdate, token: str = Header(..., descri
         update_data["password"] = hash_password(update_data["password"])
     
     if "permission_level" in update_data and update_data["permission_level"] is not None:
-        if update_data["permission_level"] not in ["admin", "uploader", "viewer"]:
+        if update_data["permission_level"] not in [models.PermissionLevel.ADMIN, models.PermissionLevel.USER]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="权限级别必须是 admin、uploader 或 viewer"
+                detail="权限级别必须是 admin 或 user"
             )
     
     # 更新字段 - 只更新非None的字段
-    for field, value in update_data.items():
-        if value is not None:
-            setattr(user, field, value)
-    
-    db.commit()
-    db.refresh(user)
-    return user
+    try:
+        for field, value in update_data.items():
+            if value is not None:
+                setattr(user, field, value)
+        
+        db.commit()
+        db.refresh(user)
+        return user
+    except Exception as e:
+        logger.error(f"更新用户信息时发生错误: {e}")
+        # 发生错误时回滚事务
+        db.rollback()
+        # 如果是数据库完整性错误，提供更友好的错误信息
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            if "username" in str(e):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="用户名已存在，请使用其他用户名"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="数据冲突，请检查输入信息"
+                )
+        else:
+            # 其他数据库错误
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="更新用户信息时发生错误，请稍后重试"
+            )
 
 
 @router.post("/delete_user")
