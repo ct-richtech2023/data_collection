@@ -272,6 +272,10 @@ class DataFileQuery(StrictModel):
     task_id: Optional[int] = Field(default=None, description="任务ID，为空则查询所有任务的文件")
     user_id: Optional[int] = Field(default=None, description="用户ID，为空则查询所有用户的文件")
     device_id: Optional[int] = Field(default=None, description="设备ID，为空则查询所有设备的文件")
+    file_name: Optional[str] = Field(default=None, description="文件名称，支持模糊查询")
+    task_name: Optional[str] = Field(default=None, description="任务名称，支持模糊查询")
+    label_name: Optional[str] = Field(default=None, description="标签名称，支持模糊查询")
+    device_name: Optional[str] = Field(default=None, description="设备名称，支持模糊查询")
     start_date: Optional[date] = Field(default=None, description="开始日期，筛选创建日期大于等于此日期的文件")
     end_date: Optional[date] = Field(default=None, description="结束日期，筛选创建日期小于等于此日期的文件")
     page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
@@ -284,6 +288,10 @@ class DataFileQuery(StrictModel):
                 "task_id": 1,
                 "user_id": 1,
                 "device_id": 1,
+                "file_name": "test.mcap",
+                "task_name": "数据采集任务",
+                "label_name": "重要数据",
+                "device_name": "传感器设备",
                 "start_date": "2024-01-01",
                 "end_date": "2024-12-31",
                 "page": 1,

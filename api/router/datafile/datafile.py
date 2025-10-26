@@ -683,6 +683,30 @@ def get_datafiles_with_pagination(
         if request_data.device_id:
             query = query.filter(models.DataFile.device_id == request_data.device_id)
         
+        # 文件名称模糊查询
+        if request_data.file_name:
+            query = query.filter(models.DataFile.file_name.ilike(f"%{request_data.file_name}%"))
+        
+        # 任务名称模糊查询
+        if request_data.task_name:
+            query = query.join(models.Task, models.DataFile.task_id == models.Task.id)
+            query = query.filter(models.Task.name.ilike(f"%{request_data.task_name}%"))
+        
+        # 设备名称模糊查询
+        if request_data.device_name:
+            # 如果已经有Task的join，需要小心处理
+            if request_data.task_name:
+                query = query.join(models.Device, models.DataFile.device_id == models.Device.id)
+            else:
+                query = query.join(models.Device, models.DataFile.device_id == models.Device.id)
+            query = query.filter(models.Device.name.ilike(f"%{request_data.device_name}%"))
+        
+        # 标签名称模糊查询
+        if request_data.label_name:
+            query = query.join(models.DataFileLabel, models.DataFile.id == models.DataFileLabel.data_file_id)
+            query = query.join(models.Label, models.DataFileLabel.label_id == models.Label.id)
+            query = query.filter(models.Label.name.ilike(f"%{request_data.label_name}%"))
+        
         # 日期筛选
         if request_data.start_date:
             # 开始日期：筛选创建日期大于等于此日期的文件（从当天00:00:00开始）
@@ -695,10 +719,11 @@ def get_datafiles_with_pagination(
             query = query.filter(models.DataFile.create_time <= end_datetime)
         
         # 获取总数（用于分页信息）
-        total_count = query.count()
+        # 使用distinct()避免重复结果，特别是在使用多个JOIN时
+        total_count = query.distinct().count()
         
         # 按ID正序排列
-        query = query.order_by(models.DataFile.id.asc())
+        query = query.distinct().order_by(models.DataFile.id.asc())
         
         # 应用分页
         offset = (request_data.page - 1) * request_data.page_size
