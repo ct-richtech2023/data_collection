@@ -311,9 +311,9 @@ class OperationLogCreate(StrictModel):
         json_schema_extra = {
             "example": {
                 "username": "admin",
-                "action": "下载文件",
+                "action": "File Download",
                 "data_file_id": 1,
-                "content": "下载了文件 example.mcap"
+                "content": "Downloaded file example.mcap"
             }
         }
 

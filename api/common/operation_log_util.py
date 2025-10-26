@@ -52,8 +52,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="用户登录",
-            content=f"用户 {username} 成功登录系统"
+            action="User Login",
+            content=f"User {username} successfully logged in"
         )
     
     @staticmethod
@@ -67,8 +67,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=admin_username,
-            action="用户注册",
-            content=f"管理员 {admin_username} 注册了新用户 {new_username}，权限级别: {permission_level}"
+            action="User Registration",
+            content=f"Admin {admin_username} registered new user {new_username}, permission level: {permission_level}"
         )
     
     @staticmethod
@@ -84,9 +84,9 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="文件上传",
+            action="File Upload",
             data_file_id=data_file_id,
-            content=f"用户 {username} 上传了文件 {filename}，关联任务ID: {task_id}，设备ID: {device_id}"
+            content=f"User {username} uploaded file {filename}, task ID: {task_id}, device ID: {device_id}"
         )
     
     @staticmethod
@@ -100,8 +100,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="批量文件下载",
-            content=f"用户 {username} 批量下载了 {file_count} 个文件，文件ID: {file_ids}"
+            action="Batch File Download",
+            content=f"User {username} downloaded {file_count} files, file IDs: {file_ids}"
         )
     
     @staticmethod
@@ -115,9 +115,9 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="文件删除",
+            action="File Delete",
             data_file_id=data_file_id,
-            content=f"用户 {username} 删除了文件 {filename}"
+            content=f"User {username} deleted file {filename}"
         )
     
     @staticmethod
@@ -132,9 +132,9 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="文件更新",
+            action="File Update",
             data_file_id=data_file_id,
-            content=f"用户 {username} 更新了文件 {filename}，更新字段: {', '.join(update_fields)}"
+            content=f"User {username} updated file {filename}, updated fields: {', '.join(update_fields)}"
         )
     
     @staticmethod
@@ -149,8 +149,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=admin_username,
-            action="用户权限更新",
-            content=f"管理员 {admin_username} 更新了用户 {target_username} 的{permission_type}权限，权限ID: {permission_ids}"
+            action="User Permission Update",
+            content=f"Admin {admin_username} updated {target_username}'s {permission_type} permissions, permission IDs: {permission_ids}"
         )
     
     @staticmethod
@@ -164,8 +164,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="任务创建",
-            content=f"用户 {username} 创建了任务 {task_name}，任务ID: {task_id}"
+            action="Task Create",
+            content=f"User {username} created task {task_name}, task ID: {task_id}"
         )
     
     @staticmethod
@@ -179,8 +179,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="任务删除",
-            content=f"用户 {username} 删除了任务 {task_name}，任务ID: {task_id}"
+            action="Task Delete",
+            content=f"User {username} deleted task {task_name}, task ID: {task_id}"
         )
     
     @staticmethod
@@ -194,8 +194,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="标签创建",
-            content=f"用户 {username} 创建了标签 {label_name}，标签ID: {label_id}"
+            action="Label Create",
+            content=f"User {username} created label {label_name}, label ID: {label_id}"
         )
     
     @staticmethod
@@ -209,8 +209,8 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="设备创建",
-            content=f"用户 {username} 创建了设备 {device_name}，设备ID: {device_id}"
+            action="Device Create",
+            content=f"User {username} created device {device_name}, device ID: {device_id}"
         )
     
     @staticmethod
@@ -225,6 +225,6 @@ class OperationLogUtil:
         return OperationLogUtil.create_log(
             db=db,
             username=username,
-            action="操作创建",
-            content=f"用户 {username} 创建了操作 {page_name} - {action}，操作ID: {operation_id}"
+            action="Operation Create",
+            content=f"User {username} created operation {page_name} - {action}, operation ID: {operation_id}"
         )
