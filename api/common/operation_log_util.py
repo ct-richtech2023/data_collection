@@ -7,6 +7,9 @@ from . import models
 from typing import Optional
 
 
+action_list = ["User Login", "User Registration", "User Permission Update", "File Upload", "File Download", "Batch File Download", "File Delete", "File Update", "Task Create", "Task Delete", "Label Create", "Device Create", "Operation Create"]
+
+
 class OperationLogUtil:
     """操作日志工具类"""
     

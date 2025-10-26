@@ -4,6 +4,7 @@ from typing import List
 from datetime import datetime, date
 from common.database import get_db
 from common import models, schemas
+from common.operation_log_util import action_list
 from router.user.auth import get_current_user
 
 router = APIRouter()
@@ -126,4 +127,32 @@ def get_operation_logs_with_pagination(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取操作日志信息时发生错误: {str(e)}"
+        )
+
+
+@router.get("/get_action")
+def get_action_dictionary(
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取操作类型数据字典 - 只有管理员可以查看"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：只有管理员可以查看操作类型字典
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有管理员可以查看操作类型字典"
+        )
+    
+    try:
+        return {
+            "actions": action_list,
+            "total_actions": len(action_list)
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail=f"获取操作类型字典时发生错误: {str(e)}"
         )

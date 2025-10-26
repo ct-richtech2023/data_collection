@@ -343,7 +343,7 @@ class OperationLogQuery(StrictModel):
             "example": {
                 "log_id": 1,
                 "username": "admin",
-                "action": "下载",
+                "action": "File Download",
                 "data_file_id": 1,
                 "start_date": "2024-01-01",
                 "end_date": "2024-12-31",
