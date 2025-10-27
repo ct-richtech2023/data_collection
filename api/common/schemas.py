@@ -1,5 +1,5 @@
-# app/schemas.py
 from __future__ import annotations
+import numpy as np
 from typing import Any, Optional, Dict, List
 from datetime import datetime, date
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -431,3 +431,37 @@ class UserPermissionsUpdate(StrictModel):
                 "operation_ids": [1, 2, 3]
             }
         }
+
+
+# --------- mcap文件解析 ----------
+class TopicInfo(BaseModel):
+    topic: str
+    msg_count: int
+    fps: float = 0
+
+
+class Annotation(BaseModel):
+    """注释数据结构"""
+    timestamp_ns: int  # 纳秒时间戳
+    text: str  # 注释文本内容
+    frame_index: int = 0  # 对应的帧索引
+
+
+class MetaData(BaseModel):
+    uuid: str
+    operator_name: str
+    annotator_name: Optional[str] = ''
+    station_id: str
+    task_command: str
+
+class McapInfo(BaseModel):
+    start_ns: int
+    end_ns: int
+    duration_sec: float
+    video_fps: float
+    video_frame_count: int
+    topic_infos: List[TopicInfo]
+    video_topics: List[str] = []
+    calibration_topics: List[str] = []
+    annotations: List[Annotation] = []  # 添加注释列表
+    metadata: Optional[MetaData] = None

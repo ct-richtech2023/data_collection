@@ -13,6 +13,7 @@ import io
 from common.database import get_db
 from common import models, schemas
 from common.permission_utils import PermissionUtils
+from common.mcap_loader import McapReader
 from router.user.auth import get_current_user
 
 router = APIRouter()
@@ -21,42 +22,6 @@ router = APIRouter()
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
-
-
-def parse_mcap_duration(file_content: bytes) -> Optional[int]:
-    """
-    解析MCAP文件获取时长（毫秒）
-    """
-    try:
-        # 创建内存中的文件对象
-        file_obj = io.BytesIO(file_content)
-        
-        # 使用MCAP reader解析文件
-        reader = make_reader(file_obj)
-        start_time = None
-        end_time = None
-        
-        # 遍历所有消息，找到最早和最晚的时间戳
-        for message in reader:
-            timestamp = message.log_time
-            
-            if start_time is None or timestamp < start_time:
-                start_time = timestamp
-            
-            if end_time is None or timestamp > end_time:
-                end_time = timestamp
-        
-        # 计算时长（纳秒转毫秒）
-        if start_time is not None and end_time is not None:
-            duration_ns = end_time - start_time
-            duration_ms = duration_ns // 1_000_000  # 纳秒转毫秒
-            return int(duration_ms)
-        
-        return None
-            
-    except Exception as e:
-        print(f"解析MCAP文件时长失败: {e}")
-        return None
 
 
 @router.post("/upload_mcap", response_model=schemas.DataFileOut)
@@ -135,17 +100,26 @@ async def upload_mcap_file(
         # 读取文件内容
         content = await file.read()
         
-        # 解析MCAP文件获取时长 60s默认时长
-        duration_ms = 60
-        
         # 生成唯一文件名
         file_extension = os.path.splitext(file.filename)[1]
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         file_path = os.path.join(UPLOAD_DIR, unique_filename)
         
-        # 保存文件
+        # 先保存文件到临时位置，用于解析
         with open(file_path, "wb") as buffer:
             buffer.write(content)
+        
+        # 使用 McapReader 获取文件信息
+        try:
+            mcap_reader = McapReader(file_path)
+            file_info = mcap_reader.file_info
+            # 将秒转换为毫秒，保留两位小数精度后四舍五入为整数
+            duration_ms = int(file_info.duration_sec * 1000)
+            mcap_reader.close()  # 关闭reader释放资源
+        except Exception as e:
+            print(f"解析MCAP文件信息失败: {e}")
+            # 如果解析失败，使用默认时长 60 秒（60000毫秒）
+            duration_ms = 60 * 1000
         
         # 生成下载URL（这里使用相对路径，实际部署时应该使用完整的URL）
         download_url = f"/uploads/{unique_filename}"
