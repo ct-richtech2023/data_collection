@@ -90,14 +90,14 @@ class DeviceQuery(StrictModel):
 
 # ---------- 操作管理 ----------
 class OperationCreate(StrictModel):
-    page_name: str = Field(min_length=1, max_length=255)
-    action: str = Field(min_length=1, max_length=255)
+    page_name: str = Field(min_length=1, max_length=255, pattern=r"^(data|task|label|device|user)$")
+    action: str = Field(min_length=1, max_length=255, pattern=r"^(upload|download|update|delete|view)$")
 
 
 class OperationUpdate(StrictModel):
     id: int
-    page_name: Optional[str] = Field(default=None)
-    action: Optional[str] = Field(default=None)
+    page_name: Optional[str] = Field(default=None, pattern=r"^(data|task|label|device|user)$")
+    action: Optional[str] = Field(default=None, pattern=r"^(upload|download|update|delete|view)$")
 
 
 class OperationOut(StrictModel):

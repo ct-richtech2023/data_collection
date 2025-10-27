@@ -12,6 +12,7 @@ from mcap.reader import make_reader
 import io
 from common.database import get_db
 from common import models, schemas
+from common.permission_utils import PermissionUtils
 from router.user.auth import get_current_user
 
 router = APIRouter()
@@ -67,15 +68,22 @@ async def upload_mcap_file(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """上传MCAP文件 - 只有管理员可以上传文件"""
+    """上传MCAP文件 - 需要设备权限和上传操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以上传文件
-    if not current_user.is_admin():
+    # 权限检查：检查设备权限
+    if not PermissionUtils.check_device_permission(db, current_user.id, device_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以上传文件"
+            detail="您没有该设备的访问权限"
+        )
+    
+    # 权限检查：检查上传操作权限
+    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "upload"):
+               raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有文件上传权限"
         )
     
     # 验证文件类型
@@ -188,18 +196,12 @@ def get_all_datafiles(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """获取所有数据文件列表 - 只有管理员可以查看所有文件"""
+    """获取数据文件列表 - 只返回用户有权限的设备的数据"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以查看所有文件
-    if not current_user.is_admin():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以查看所有文件"
-        )
-    
-    datafiles = db.query(models.DataFile).order_by(models.DataFile.id.asc()).all()
+    # 只返回用户有权限的设备的数据文件（基于设备权限，管理员不受限制）
+    datafiles = PermissionUtils.get_accessible_datafiles_query(db, current_user.id).order_by(models.DataFile.id.asc()).all()
     return datafiles
 
 
@@ -209,16 +211,9 @@ def get_datafile_by_id(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """根据ID获取数据文件信息 - 只有管理员可以查看文件信息"""
+    """根据ID获取数据文件信息 - 基于设备权限，管理员不受限制"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
-    
-    # 权限检查：只有管理员可以查看文件信息
-    if not current_user.is_admin():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以查看文件信息"
-        )
     
     datafile = db.query(models.DataFile).filter(models.DataFile.id == datafile_id).first()
     if not datafile:
@@ -226,6 +221,14 @@ def get_datafile_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="数据文件不存在"
         )
+    
+    # 权限检查：检查设备权限（管理员不受限制）
+    if not PermissionUtils.check_datafile_access(db, current_user.id, datafile_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有访问该文件的权限"
+        )
+    
     return datafile
 
 
@@ -235,15 +238,15 @@ def update_datafile(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """更新数据文件信息 - 只有管理员可以更新文件信息"""
+    """更新数据文件信息 - 需要设备权限和更新操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以更新文件信息
-    if not current_user.is_admin():
+    # 权限检查：检查更新操作权限
+    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "update"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以更新文件信息"
+            detail="您没有文件更新权限"
         )
     
     # 从datafile_update中获取数据文件ID
@@ -255,6 +258,13 @@ def update_datafile(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="数据文件不存在"
+        )
+    
+    # 权限检查：检查设备权限
+    if not PermissionUtils.check_datafile_access(db, current_user.id, datafile_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有访问该文件的权限"
         )
     
     # 更新数据文件信息 - 只更新提供的字段
@@ -353,15 +363,15 @@ def delete_datafile(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """删除数据文件 - 只有管理员可以删除文件"""
+    """删除数据文件 - 需要设备权限和删除操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以删除文件
-    if not current_user.is_admin():
+    # 权限检查：检查删除操作权限
+    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "delete"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以删除文件"
+            detail="您没有文件删除权限"
         )
     
     # 查找数据文件
@@ -370,6 +380,13 @@ def delete_datafile(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="数据文件不存在"
+        )
+    
+    # 权限检查：检查设备权限
+    if not PermissionUtils.check_datafile_access(db, current_user.id, datafile_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有访问该文件的权限"
         )
     
     # 删除关联的数据文件标签映射
@@ -405,15 +422,15 @@ def download_file(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """下载单个数据文件 - 只有管理员可以下载文件"""
+    """下载单个数据文件 - 需要设备权限和下载操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以下载文件
-    if not current_user.is_admin():
+    # 权限检查：检查下载操作权限
+    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "download"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以下载文件"
+            detail="您没有文件下载权限"
         )
     
     # 查找数据文件
@@ -422,6 +439,13 @@ def download_file(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="数据文件不存在"
+        )
+    
+    # 权限检查：检查设备权限
+    if not PermissionUtils.check_datafile_access(db, current_user.id, datafile_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有访问该文件的权限"
         )
     
     # 构建文件路径
@@ -465,15 +489,15 @@ def download_files_zip(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """下载多个数据文件打包成ZIP - 只有管理员可以下载文件"""
+    """下载多个数据文件打包成ZIP - 需要设备权限和下载操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以下载文件
-    if not current_user.is_admin():
+    # 权限检查：检查下载操作权限
+    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "download"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以下载文件"
+            detail="您没有文件下载权限"
         )
     
     if not datafile_ids:
@@ -482,13 +506,18 @@ def download_files_zip(
             detail="请提供要下载的文件ID列表"
         )
     
-    # 查找数据文件
-    datafiles = db.query(models.DataFile).filter(models.DataFile.id.in_(datafile_ids)).all()
-    if not datafiles:
+    # 查找数据文件，只返回用户有权限的文件
+    accessible_datafiles = PermissionUtils.get_accessible_datafiles_query(db, current_user.id).filter(
+        models.DataFile.id.in_(datafile_ids)
+    ).all()
+    
+    if not accessible_datafiles:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="未找到任何数据文件"
+            detail="未找到任何您有权限访问的数据文件"
         )
+    
+    datafiles = accessible_datafiles
     
     # 检查文件是否存在
     missing_files = []
@@ -653,20 +682,13 @@ def get_datafiles_with_pagination(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """获取数据文件列表，支持分页和多条件查询 - 只有管理员可以查看"""
+    """获取数据文件列表，支持分页和多条件查询 - 只返回用户有权限的设备的数据"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以查看文件信息
-    if not current_user.is_admin():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以查看文件信息"
-        )
-    
     try:
-        # 构建查询
-        query = db.query(models.DataFile)
+        # 构建查询，只查询用户有权限的设备的数据
+        query = PermissionUtils.get_accessible_datafiles_query(db, current_user.id)
         
         # 如果指定了数据文件ID，则只查询该文件
         if request_data.data_file_id:
