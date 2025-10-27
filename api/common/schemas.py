@@ -290,10 +290,10 @@ class DataFileQuery(StrictModel):
                 "device_id": 1,
                 "file_name": "test.mcap",
                 "task_name": "数据采集任务",
-                "label_name": "重要数据",
-                "device_name": "传感器设备",
-                "start_date": "2024-01-01",
-                "end_date": "2024-12-31",
+                "label_name": "标签",
+                "device_name": "数据采集设备",
+                "start_date": "2025-10-01",
+                "end_date": "2099-12-31",
                 "page": 1,
                 "page_size": 10
             }
@@ -345,8 +345,8 @@ class OperationLogQuery(StrictModel):
                 "username": "admin",
                 "action": "File Download",
                 "data_file_id": 1,
-                "start_date": "2024-01-01",
-                "end_date": "2024-12-31",
+                "start_date": "2025-10-01",
+                "end_date": "2099-12-31",
                 "page": 1,
                 "page_size": 10
             }

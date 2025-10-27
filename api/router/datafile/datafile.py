@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 import os
 import uuid
@@ -731,9 +732,34 @@ def get_datafiles_with_pagination(
         
         # 构建响应数据
         result = []
+        
+        # 获取所有任务，按ID排序
+        all_tasks = db.query(models.Task).order_by(models.Task.id.asc()).all()
+        
+        # 为每个任务计算数据文件数量和总时长
+        task_data = {}
+        for task in all_tasks:
+            # 计算该任务的数据文件数量
+            datafile_count = db.query(models.DataFile).filter(models.DataFile.task_id == task.id).count()
+            
+            # 计算该任务的总时长（毫秒）
+            total_duration = db.query(func.coalesce(func.sum(models.DataFile.duration_ms), 0)).filter(
+                models.DataFile.task_id == task.id,
+                models.DataFile.duration_ms.isnot(None)
+            ).scalar() or 0
+            
+            task_data[task.id] = {
+                "id": task.id,
+                "name": task.name,
+                "create_time": task.create_time,
+                "update_time": task.update_time,
+                "datafile_count": datafile_count,
+                "duration_ms": total_duration
+            }
+        
         for datafile in datafiles:
-            # 获取关联的任务信息
-            task = db.query(models.Task).filter(models.Task.id == datafile.task_id).first()
+            # 获取关联的任务信息（从已查询的任务中获取）
+            task = next((t for t in all_tasks if t.id == datafile.task_id), None)
             task_name = task.name if task else "未知任务"
             
             # 获取关联的用户信息
@@ -781,6 +807,7 @@ def get_datafiles_with_pagination(
         
         return {
             "datafiles": result,
+            "tasks": list(task_data.values()),
             "pagination": {
                 "current_page": request_data.page,
                 "page_size": request_data.page_size,
