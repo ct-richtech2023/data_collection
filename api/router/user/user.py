@@ -86,6 +86,72 @@ def login(login_data: schemas.UserLogin, db: Session = Depends(get_db)):
     return {"access_token": token, "token_type": "bearer"}
 
 
+@router.get("/get_current_user_info")
+def get_current_user_info(token: str = Header(..., description="JWT token"), db: Session = Depends(get_db)):
+    """获取当前用户信息，包含设备权限和操作权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 获取用户设备权限
+    device_permissions = db.query(
+        models.UserDevicePermission,
+        models.Device
+    ).join(
+        models.Device, models.UserDevicePermission.device_id == models.Device.id
+    ).filter(
+        models.UserDevicePermission.user_id == current_user.id
+    ).all()
+    
+    # 构建设备权限数据
+    device_permissions_data = []
+    for permission, device in device_permissions:
+        device_permissions_data.append({
+            "device_id": device.id,
+            "device_name": device.name,
+            "device_sn": device.sn,
+            "device_description": device.description,
+            "permission_id": permission.id,
+            "permission_create_time": permission.create_time
+        })
+    
+    # 获取用户操作权限
+    operation_permissions = db.query(
+        models.UserOperationPermission,
+        models.Operation
+    ).join(
+        models.Operation, models.UserOperationPermission.operation_id == models.Operation.id
+    ).filter(
+        models.UserOperationPermission.user_id == current_user.id
+    ).all()
+    
+    # 构建操作权限数据
+    operation_permissions_data = []
+    for permission, operation in operation_permissions:
+        operation_permissions_data.append({
+            "operation_id": operation.id,
+            "page_name": operation.page_name,
+            "action": operation.action,
+            "permission_id": permission.id,
+            "permission_create_time": permission.create_time
+        })
+    
+    # 构建完整的用户信息响应
+    user_info = {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "permission_level": "admin" if current_user.is_admin() else "user",
+        "create_time": current_user.create_time,
+        "update_time": current_user.update_time,
+        "device_permissions": device_permissions_data,
+        "operation_permissions": operation_permissions_data,
+        "device_permission_count": len(device_permissions_data),
+        "operation_permission_count": len(operation_permissions_data)
+    }
+    
+    return user_info
+
+
 @router.get("/get_all_users")
 def get_all_users(token: str = Header(..., description="JWT token"), db: Session = Depends(get_db)):
     """获取所有用户数据 - 需要管理员权限"""
