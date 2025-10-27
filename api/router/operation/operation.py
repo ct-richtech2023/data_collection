@@ -229,16 +229,12 @@ def get_operations_with_pagination(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """获取操作列表，支持分页和按ID查询 - 只有管理员可以查看"""
+    """获取操作列表，支持分页和按ID查询 - 任何已认证用户都可以查看"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以查看操作信息
-    if not current_user.is_admin():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以查看操作信息"
-        )
+    # 权限检查：任何已认证的用户都可以查看操作信息
+    # 移除管理员限制，允许所有数据库中的用户访问
     
     try:
         # 构建查询

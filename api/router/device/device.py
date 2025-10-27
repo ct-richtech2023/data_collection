@@ -224,20 +224,27 @@ def get_devices_with_pagination(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """获取设备列表，支持分页和按ID查询 - 只有管理员可以查看"""
+    """获取设备列表，支持分页和按ID查询 - 根据用户权限过滤设备"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
-    # 权限检查：只有管理员可以查看设备信息
-    if not current_user.is_admin():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员可以查看设备信息"
-        )
+    # 权限检查：根据用户设备权限过滤查询结果
+    # 管理员可以查看所有设备，普通用户只能查看有权限的设备
     
     try:
         # 构建查询
         query = db.query(models.Device)
+        
+        # 根据用户权限过滤设备
+        if not current_user.is_admin():
+            # 非管理员用户：只显示有权限的设备
+            from common.permission_utils import PermissionUtils
+            user_device_permissions = PermissionUtils.get_user_device_permissions(db, current_user.id)
+            if user_device_permissions:
+                query = query.filter(models.Device.id.in_(user_device_permissions))
+            else:
+                # 如果用户没有任何设备权限，返回空结果
+                query = query.filter(False)
         
         # 如果指定了设备ID，则只查询该设备
         if request_data.device_id:
