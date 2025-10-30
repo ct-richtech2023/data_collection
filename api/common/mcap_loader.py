@@ -87,6 +87,7 @@ class McapReader(QObject):
             # 加载现有注释
             logger.info('loading annotations start...')
             annotations = self._load_annotations()
+            logger.info(f"annotations: {annotations}")
             logger.info('loading annotations end...')
 
             # 加载原有元数据
@@ -97,7 +98,7 @@ class McapReader(QObject):
                                  calibration_topics=self.calibration_topics.copy(), video_fps=self.fps,
                                  video_frame_count=min_video_count - 1, annotations=annotations, metadata=metadata)
             self.file_info = file_info
-            logger.info(f"file_info: {file_info}")
+            # logger.info(f"file_info: {file_info}")
         return file_info
 
     def _load_annotations(self):
@@ -126,7 +127,7 @@ class McapReader(QObject):
                 reader = make_reader(f)
                 metadata_dict = {}
                 for metadata in reader.iter_metadata():
-                    logger.info(f"Metadata '{metadata.name}': {metadata.metadata}")
+                    # logger.info(f"Metadata '{metadata.name}': {metadata.metadata}")
                     metadata_dict.update(metadata.metadata)
                 if metadata_dict:
                     metadata = MetaData(uuid=metadata_dict.get('session-metadata.session-uuid'), operator_name=metadata_dict.get('session-metadata.operator-id'),

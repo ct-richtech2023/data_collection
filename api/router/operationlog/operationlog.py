@@ -6,6 +6,7 @@ from common.database import get_db
 from common import models, schemas
 from common.operation_log_util import action_list
 from router.user.auth import get_current_user
+from loguru import logger
 
 router = APIRouter()
 
@@ -20,9 +21,11 @@ def get_operation_logs_with_pagination(
     """获取操作日志列表，支持分页和多条件查询 - 只有管理员可以查看"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[OpLog][Page] 请求 | user_id={getattr(current_user, 'id', None)} filters={{'log_id': {'set' if bool(getattr(request_data, 'log_id', None)) else 'unset'}, 'username': {'set' if bool(getattr(request_data, 'username', None)) else 'unset'}, 'action': {'set' if bool(getattr(request_data, 'action', None)) else 'unset'}, 'data_file_id': {'set' if bool(getattr(request_data, 'data_file_id', None)) else 'unset'}, 'start_date': {'set' if bool(getattr(request_data, 'start_date', None)) else 'unset'}, 'end_date': {'set' if bool(getattr(request_data, 'end_date', None)) else 'unset'}}}")
     
     # 权限检查：只有管理员可以查看日志信息
     if not current_user.is_admin():
+        logger.warning(f"[OpLog][Page] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看日志信息"
@@ -61,6 +64,7 @@ def get_operation_logs_with_pagination(
         
         # 获取总数（用于分页信息）
         total_count = query.count()
+        logger.info(f"[OpLog][Page] 查询完成 | total_count={total_count}")
         
         # 按ID正序排列
         query = query.order_by(models.OperationLog.id.asc())
@@ -68,6 +72,7 @@ def get_operation_logs_with_pagination(
         # 应用分页
         offset = (request_data.page - 1) * request_data.page_size
         logs = query.offset(offset).limit(request_data.page_size).all()
+        logger.info(f"[OpLog][Page] 分页 | page={request_data.page} size={request_data.page_size} page_count={len(logs)}")
         
         # 构建响应数据
         result = []
@@ -111,7 +116,7 @@ def get_operation_logs_with_pagination(
         # 计算分页信息
         total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
         
-        return {
+        resp = {
             "logs": result,
             "pagination": {
                 "current_page": request_data.page,
@@ -122,8 +127,11 @@ def get_operation_logs_with_pagination(
                 "has_prev": request_data.page > 1
             }
         }
+        logger.info(f"[OpLog][Page] 成功 | current_page={request_data.page} total_pages={total_pages}")
+        return resp
         
     except Exception as e:
+        logger.exception(f"[OpLog][Page] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取操作日志信息时发生错误: {str(e)}"
@@ -138,20 +146,25 @@ def get_action_dictionary(
     """获取操作类型数据字典 - 只有管理员可以查看"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[OpLog][ActionDict] 请求 | user_id={current_user.id}")
     
     # 权限检查：只有管理员可以查看操作类型字典
     if not current_user.is_admin():
+        logger.warning(f"[OpLog][ActionDict] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看操作类型字典"
         )
     
     try:
-        return {
+        resp = {
             "actions": action_list,
             "total_actions": len(action_list)
         }
+        logger.info(f"[OpLog][ActionDict] 成功 | total_actions={len(action_list)}")
+        return resp
     except Exception as e:
+        logger.exception(f"[OpLog][ActionDict] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail=f"获取操作类型字典时发生错误: {str(e)}"

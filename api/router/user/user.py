@@ -13,9 +13,11 @@ def register(user_in: schemas.User, token: str = Header(..., description="JWT to
     """用户注册 - 只有管理员可以注册新用户"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][Register] 请求 | by_user_id={getattr(current_user, 'id', None)} username={user_in.username} email={user_in.email}")
     
     # 权限检查：只有管理员可以注册新用户
     if not current_user.is_admin():
+        logger.warning(f"[User][Register] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以注册新用户"
@@ -24,6 +26,7 @@ def register(user_in: schemas.User, token: str = Header(..., description="JWT to
     # 检查用户名是否已存在
     username_exists = db.query(models.User).filter(models.User.username == user_in.username).first()
     if username_exists:
+        logger.warning(f"[User][Register] 重名 | username={user_in.username}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
             detail="用户名已存在，请使用其他用户名"
@@ -47,10 +50,12 @@ def register(user_in: schemas.User, token: str = Header(..., description="JWT to
             db, current_user.username, user_in.username, user_in.permission_level
         )
         
+        logger.info(f"[User][Register] 成功 | user_id={user.id} username={user.username}")
         return user
     except Exception as e:
         # 发生错误时回滚事务
         db.rollback()
+        logger.exception(f"[User][Register] 失败: {e}")
         # 如果是数据库完整性错误，提供更友好的错误信息
         if "unique" in str(e).lower() or "duplicate" in str(e).lower():
             if "username" in str(e):
@@ -74,8 +79,10 @@ def register(user_in: schemas.User, token: str = Header(..., description="JWT to
 @router.post("/auth/login")
 def login(login_data: schemas.UserLogin, db: Session = Depends(get_db)):
     """用户登录 - 使用用户名和密码"""
+    logger.info(f"[User][Login] 请求 | username={login_data.username}")
     user = authenticate_user(db, username=login_data.username, password=login_data.password)
     if not user:
+        logger.warning(f"[User][Login] 失败 | 用户名或密码错误 username={login_data.username}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
     
     # 创建登录操作日志
@@ -83,6 +90,7 @@ def login(login_data: schemas.UserLogin, db: Session = Depends(get_db)):
     OperationLogUtil.log_user_login(db, user.username)
     
     token = create_access_token({"sub": user.username})
+    logger.info(f"[User][Login] 成功 | user_id={user.id} username={user.username}")
     return {"access_token": token, "token_type": "bearer"}
 
 
@@ -91,6 +99,7 @@ def get_current_user_info(token: str = Header(..., description="JWT token"), db:
     """获取当前用户信息，包含设备权限和操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][Me] 请求 | user_id={current_user.id} username={current_user.username}")
     
     # 获取用户设备权限
     device_permissions = db.query(
@@ -149,6 +158,7 @@ def get_current_user_info(token: str = Header(..., description="JWT token"), db:
         "operation_permission_count": len(operation_permissions_data)
     }
     
+    logger.info(f"[User][Me] 成功 | device_perms={len(device_permissions_data)} op_perms={len(operation_permissions_data)}")
     return user_info
 
 
@@ -157,15 +167,18 @@ def get_all_users(token: str = Header(..., description="JWT token"), db: Session
     """获取所有用户数据 - 需要管理员权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][ListAll] 请求 | user_id={current_user.id}")
     
     # 检查权限：只有管理员可以查看所有用户
     if not current_user.is_admin():
+        logger.warning(f"[User][ListAll] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看所有用户数据"
         )
     
     users = db.query(models.User).all()
+    logger.info(f"[User][ListAll] 成功 | count={len(users)}")
     return users
 
 
@@ -174,9 +187,11 @@ def get_user_by_id(user_id: int, token: str = Header(..., description="JWT token
     """根据ID获取用户数据 - 只有管理员可以查看用户信息"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][GetById] 请求 | by_user_id={current_user.id} user_id={user_id}")
     
     # 权限检查：只有管理员可以查看用户信息
     if not current_user.is_admin():
+        logger.warning(f"[User][GetById] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看用户信息"
@@ -184,11 +199,12 @@ def get_user_by_id(user_id: int, token: str = Header(..., description="JWT token
     
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
+        logger.warning(f"[User][GetById] 未找到 | user_id={user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
         )
-    
+    logger.info(f"[User][GetById] 成功 | user_id={user.id} username={user.username}")
     return user
 
 
@@ -197,9 +213,11 @@ def update_user(user_update: schemas.UserUpdate, token: str = Header(..., descri
     """修改用户信息 - 只有管理员可以修改用户信息"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][Update] 请求 | by_user_id={current_user.id} payload={user_update.model_dump(exclude_none=True)}")
     
     # 权限检查：只有管理员可以修改用户信息
     if not current_user.is_admin():
+        logger.warning(f"[User][Update] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以修改用户信息"
@@ -218,6 +236,7 @@ def update_user(user_update: schemas.UserUpdate, token: str = Header(..., descri
     # 查找要修改的用户
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
+        logger.warning(f"[User][Update] 未找到 | user_id={user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
@@ -252,6 +271,7 @@ def update_user(user_update: schemas.UserUpdate, token: str = Header(..., descri
             models.User.id != user_id
         ).first()
         if existing_user:
+            logger.warning(f"[User][Update] 用户名冲突 | user_id={user_id} username={update_data['username']}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="用户名已存在"
@@ -288,9 +308,10 @@ def update_user(user_update: schemas.UserUpdate, token: str = Header(..., descri
         
         db.commit()
         db.refresh(user)
+        logger.info(f"[User][Update] 成功 | user_id={user.id}")
         return user
     except Exception as e:
-        logger.error(f"更新用户信息时发生错误: {e}")
+        logger.exception(f"[User][Update] 失败: {e}")
         # 发生错误时回滚事务
         db.rollback()
         # 如果是数据库完整性错误，提供更友好的错误信息
@@ -318,9 +339,11 @@ def delete_user(user_id: int,token: str = Header(..., description="JWT token"),d
     """删除用户 - 只有管理员可以删除用户"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][Delete] 请求 | by_user_id={current_user.id} user_id={user_id}")
     
     # 权限检查：只有管理员可以删除用户
     if not current_user.is_admin():
+        logger.warning(f"[User][Delete] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以删除用户"
@@ -329,6 +352,7 @@ def delete_user(user_id: int,token: str = Header(..., description="JWT token"),d
     # 查找要删除的用户
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
+        logger.warning(f"[User][Delete] 未找到 | user_id={user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
@@ -337,7 +361,7 @@ def delete_user(user_id: int,token: str = Header(..., description="JWT token"),d
     # 删除用户
     db.delete(user)
     db.commit()
-    
+    logger.info(f"[User][Delete] 成功 | user_id={user_id}")
     return {"message": f"用户 {user.username} 已成功删除"}
 
 
@@ -351,9 +375,11 @@ def add_device_permission(
     """为用户添加设备权限 - 只有管理员可以添加设备权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Device][Add] 请求 | by_user_id={current_user.id} user_id={permission.user_id} device_id={permission.device_id}")
     
     # 权限检查：只有管理员可以添加设备权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Device][Add] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以添加设备权限"
@@ -362,6 +388,7 @@ def add_device_permission(
     # 检查用户是否存在
     user = db.query(models.User).filter(models.User.id == permission.user_id).first()
     if not user:
+        logger.warning(f"[UserPerm][Device][Add] 用户不存在 | user_id={permission.user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
@@ -370,6 +397,7 @@ def add_device_permission(
     # 检查设备是否存在
     device = db.query(models.Device).filter(models.Device.id == permission.device_id).first()
     if not device:
+        logger.warning(f"[UserPerm][Device][Add] 设备不存在 | device_id={permission.device_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="设备不存在"
@@ -381,6 +409,7 @@ def add_device_permission(
         models.UserDevicePermission.device_id == permission.device_id
     ).first()
     if existing_permission:
+        logger.warning(f"[UserPerm][Device][Add] 已存在 | user_id={permission.user_id} device_id={permission.device_id}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="该用户已拥有此设备权限"
@@ -394,6 +423,7 @@ def add_device_permission(
     db.add(db_permission)
     db.commit()
     db.refresh(db_permission)
+    logger.info(f"[UserPerm][Device][Add] 成功 | id={db_permission.id}")
     return db_permission
 
 
@@ -406,9 +436,11 @@ def get_user_device_permissions(
     """获取用户的设备权限列表 - 只有管理员可以查看用户设备权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Device][ListByUser] 请求 | by_user_id={current_user.id} user_id={user_id}")
     
     # 权限检查：只有管理员可以查看用户设备权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Device][ListByUser] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看用户设备权限"
@@ -417,6 +449,7 @@ def get_user_device_permissions(
     # 检查用户是否存在
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
+        logger.warning(f"[UserPerm][Device][ListByUser] 用户不存在 | user_id={user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
@@ -426,6 +459,7 @@ def get_user_device_permissions(
     permissions = db.query(models.UserDevicePermission).filter(
         models.UserDevicePermission.user_id == user_id
     ).all()
+    logger.info(f"[UserPerm][Device][ListByUser] 成功 | count={len(permissions)}")
     return permissions
 
 
@@ -438,9 +472,11 @@ def get_device_user_permissions(
     """获取设备的用户权限列表 - 只有管理员可以查看设备用户权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Device][ListByDevice] 请求 | by_user_id={current_user.id} device_id={device_id}")
     
     # 权限检查：只有管理员可以查看设备用户权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Device][ListByDevice] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看设备用户权限"
@@ -449,6 +485,7 @@ def get_device_user_permissions(
     # 检查设备是否存在
     device = db.query(models.Device).filter(models.Device.id == device_id).first()
     if not device:
+        logger.warning(f"[UserPerm][Device][ListByDevice] 设备不存在 | device_id={device_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="设备不存在"
@@ -458,6 +495,7 @@ def get_device_user_permissions(
     permissions = db.query(models.UserDevicePermission).filter(
         models.UserDevicePermission.device_id == device_id
     ).all()
+    logger.info(f"[UserPerm][Device][ListByDevice] 成功 | count={len(permissions)}")
     return permissions
 
 
@@ -471,9 +509,11 @@ def remove_device_permission(
     """移除用户的设备权限 - 只有管理员可以移除设备权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Device][Remove] 请求 | by_user_id={current_user.id} user_id={user_id} device_id={device_id}")
     
     # 权限检查：只有管理员可以移除设备权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Device][Remove] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以移除设备权限"
@@ -486,6 +526,7 @@ def remove_device_permission(
     ).first()
     
     if not permission:
+        logger.warning(f"[UserPerm][Device][Remove] 权限记录不存在 | user_id={user_id} device_id={device_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="权限记录不存在"
@@ -498,7 +539,7 @@ def remove_device_permission(
     # 删除权限记录
     db.delete(permission)
     db.commit()
-    
+    logger.info(f"[UserPerm][Device][Remove] 成功 | user_id={user_id} device_id={device_id}")
     return {"message": f"已成功移除用户 {user.username if user else user_id} 对设备 {device.name if device else device_id} 的权限"}
 
 
@@ -512,9 +553,11 @@ def add_operation_permission(
     """为用户添加操作权限 - 只有管理员可以添加操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Op][Add] 请求 | by_user_id={current_user.id} user_id={permission.user_id} operation_id={permission.operation_id}")
     
     # 权限检查：只有管理员可以添加操作权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Op][Add] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以添加操作权限"
@@ -523,6 +566,7 @@ def add_operation_permission(
     # 检查用户是否存在
     user = db.query(models.User).filter(models.User.id == permission.user_id).first()
     if not user:
+        logger.warning(f"[UserPerm][Op][Add] 用户不存在 | user_id={permission.user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
@@ -531,6 +575,7 @@ def add_operation_permission(
     # 检查操作是否存在
     operation = db.query(models.Operation).filter(models.Operation.id == permission.operation_id).first()
     if not operation:
+        logger.warning(f"[UserPerm][Op][Add] 操作不存在 | operation_id={permission.operation_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="操作不存在"
@@ -542,6 +587,7 @@ def add_operation_permission(
         models.UserOperationPermission.operation_id == permission.operation_id
     ).first()
     if existing_permission:
+        logger.warning(f"[UserPerm][Op][Add] 已存在 | user_id={permission.user_id} operation_id={permission.operation_id}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="该用户已拥有此操作权限"
@@ -555,6 +601,7 @@ def add_operation_permission(
     db.add(db_permission)
     db.commit()
     db.refresh(db_permission)
+    logger.info(f"[UserPerm][Op][Add] 成功 | id={db_permission.id}")
     return db_permission
 
 
@@ -567,9 +614,11 @@ def get_user_operation_permissions(
     """获取用户的操作权限列表 - 只有管理员可以查看用户操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Op][ListByUser] 请求 | by_user_id={current_user.id} user_id={user_id}")
     
     # 权限检查：只有管理员可以查看用户操作权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Op][ListByUser] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看用户操作权限"
@@ -578,6 +627,7 @@ def get_user_operation_permissions(
     # 检查用户是否存在
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
+        logger.warning(f"[UserPerm][Op][ListByUser] 用户不存在 | user_id={user_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="用户不存在"
@@ -587,6 +637,7 @@ def get_user_operation_permissions(
     permissions = db.query(models.UserOperationPermission).filter(
         models.UserOperationPermission.user_id == user_id
     ).all()
+    logger.info(f"[UserPerm][Op][ListByUser] 成功 | count={len(permissions)}")
     return permissions
 
 
@@ -599,9 +650,11 @@ def get_operation_user_permissions(
     """获取操作用户权限列表 - 只有管理员可以查看操作用户权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Op][ListByOp] 请求 | by_user_id={current_user.id} operation_id={operation_id}")
     
     # 权限检查：只有管理员可以查看操作用户权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Op][ListByOp] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看操作用户权限"
@@ -610,6 +663,7 @@ def get_operation_user_permissions(
     # 检查操作是否存在
     operation = db.query(models.Operation).filter(models.Operation.id == operation_id).first()
     if not operation:
+        logger.warning(f"[UserPerm][Op][ListByOp] 操作不存在 | operation_id={operation_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="操作不存在"
@@ -619,6 +673,7 @@ def get_operation_user_permissions(
     permissions = db.query(models.UserOperationPermission).filter(
         models.UserOperationPermission.operation_id == operation_id
     ).all()
+    logger.info(f"[UserPerm][Op][ListByOp] 成功 | count={len(permissions)}")
     return permissions
 
 
@@ -632,9 +687,11 @@ def remove_operation_permission(
     """移除用户的操作权限 - 只有管理员可以移除操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][Op][Remove] 请求 | by_user_id={current_user.id} user_id={user_id} operation_id={operation_id}")
     
     # 权限检查：只有管理员可以移除操作权限
     if not current_user.is_admin():
+        logger.warning(f"[UserPerm][Op][Remove] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以移除操作权限"
@@ -647,6 +704,7 @@ def remove_operation_permission(
     ).first()
     
     if not permission:
+        logger.warning(f"[UserPerm][Op][Remove] 权限记录不存在 | user_id={user_id} operation_id={operation_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="权限记录不存在"
@@ -659,7 +717,7 @@ def remove_operation_permission(
     # 删除权限记录
     db.delete(permission)
     db.commit()
-    
+    logger.info(f"[UserPerm][Op][Remove] 成功 | user_id={user_id} operation_id={operation_id}")
     return {"message": f"已成功移除用户 {user.username if user else user_id} 对操作 {operation.page_name}.{operation.action if operation else operation_id} 的权限"}
 
 
@@ -672,6 +730,7 @@ def add_user_permissions(
     """为用户同时添加设备权限和操作权限 - 只有管理员可以添加权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][BatchAdd] 请求 | by_user_id={current_user.id} user_id={permissions.user_id} device_ids={permissions.device_ids} operation_ids={permissions.operation_ids}")
     
     # 权限检查：只有管理员可以添加权限
     if not current_user.is_admin():
@@ -758,6 +817,7 @@ def add_user_permissions(
         
         # 提交所有更改
         db.commit()
+        logger.info(f"[UserPerm][BatchAdd] 成功 | user_id={permissions.user_id} add_devices={len(results['device_permissions'])} add_ops={len(results['operation_permissions'])} errors={len(results['errors'])}")
         
         return {
             "message": "权限添加完成",
@@ -771,6 +831,7 @@ def add_user_permissions(
         
     except Exception as e:
         db.rollback()
+        logger.exception(f"[UserPerm][BatchAdd] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"添加权限时发生错误: {str(e)}"
@@ -786,6 +847,7 @@ def update_user_permissions(
     """修改用户权限 - 只有管理员可以修改权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[UserPerm][BatchUpdate] 请求 | by_user_id={current_user.id} user_id={permissions.user_id} device_ids={permissions.device_ids} operation_ids={permissions.operation_ids}")
     
     # 权限检查：只有管理员可以修改权限
     if not current_user.is_admin():
@@ -874,6 +936,7 @@ def update_user_permissions(
         
         # 提交所有更改
         db.commit()
+        logger.info(f"[UserPerm][BatchUpdate] 成功 | user_id={permissions.user_id} devices={len(results['updated_device_permissions'])} ops={len(results['updated_operation_permissions'])} errors={len(results['errors'])}")
         
         return {
             "message": "权限修改完成",
@@ -887,6 +950,7 @@ def update_user_permissions(
         
     except Exception as e:
         db.rollback()
+        logger.exception(f"[UserPerm][BatchUpdate] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"修改权限时发生错误: {str(e)}"
@@ -903,6 +967,7 @@ def get_users_with_pagination(
     """获取用户及其权限信息，支持按用户ID查询和分页 - 只有管理员可以查看"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[User][Page] 请求 | by_user_id={current_user.id} filters={{'user_id': { 'set' if bool(getattr(request_data, 'user_id', None)) else 'unset' }}}")
     
     # 权限检查：只有管理员可以查看用户权限信息
     if not current_user.is_admin():
@@ -921,6 +986,7 @@ def get_users_with_pagination(
         
         # 获取总数（用于分页信息）
         total_count = query.count()
+        logger.info(f"[User][Page] 查询完成 | total_count={total_count}")
         
         # 按ID正序排列
         query = query.order_by(models.User.id.asc())
@@ -928,6 +994,7 @@ def get_users_with_pagination(
         # 应用分页
         offset = (request_data.page - 1) * request_data.page_size
         users = query.offset(offset).limit(request_data.page_size).all()
+        logger.info(f"[User][Page] 分页 | page={request_data.page} size={request_data.page_size} page_count={len(users)}")
         
         # 构建设备和操作的映射字典（只获取用户权限相关的数据）
         device_map = {}
@@ -1002,7 +1069,7 @@ def get_users_with_pagination(
         # 计算分页信息
         total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
         
-        return {
+        resp = {
             "users": result,
             "pagination": {
                 "current_page": request_data.page,
@@ -1013,8 +1080,11 @@ def get_users_with_pagination(
                 "has_prev": request_data.page > 1
             }
         }
+        logger.info(f"[User][Page] 成功 | current_page={request_data.page} total_pages={total_pages}")
+        return resp
         
     except Exception as e:
+        logger.exception(f"[User][Page] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取用户权限信息时发生错误: {str(e)}"

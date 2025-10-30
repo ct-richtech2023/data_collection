@@ -4,6 +4,7 @@ from typing import List, Optional
 from common.database import get_db
 from common import models, schemas
 from router.user.auth import get_current_user
+from loguru import logger
 
 router = APIRouter()
 
@@ -17,9 +18,11 @@ def create_task(
     """创建任务 - 只有管理员可以创建任务"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Task][Create] 请求 | user_id={getattr(current_user, 'id', None)} name={task.name}")
     
     # 权限检查：只有管理员可以创建任务
     if not current_user.is_admin():
+        logger.warning(f"[Task][Create] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以创建任务"
@@ -28,6 +31,7 @@ def create_task(
     # 检查任务名称是否已存在
     existing_task = db.query(models.Task).filter(models.Task.name == task.name).first()
     if existing_task:
+        logger.warning(f"[Task][Create] 名称已存在 | name={task.name}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="任务名称已存在"
@@ -40,6 +44,7 @@ def create_task(
     db.add(db_task)
     db.commit()
     db.refresh(db_task)
+    logger.info(f"[Task][Create] 成功 | task_id={db_task.id}")
     
     # 记录任务创建日志
     from common.operation_log_util import OperationLogUtil
@@ -58,15 +63,18 @@ def get_all_tasks(
     """获取所有任务列表 - 只有管理员可以查看所有任务"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Task][ListAll] 请求 | user_id={current_user.id}")
     
     # 权限检查：只有管理员可以查看所有任务
     if not current_user.is_admin():
+        logger.warning(f"[Task][ListAll] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看所有任务"
         )
     
     tasks = db.query(models.Task).order_by(models.Task.id.asc()).all()
+    logger.info(f"[Task][ListAll] 成功 | count={len(tasks)}")
     return tasks
 
 
@@ -79,9 +87,11 @@ def get_task_by_id(
     """根据ID获取任务信息 - 只有管理员可以查看任务信息"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Task][GetById] 请求 | user_id={current_user.id} task_id={task_id}")
     
     # 权限检查：只有管理员可以查看任务信息
     if not current_user.is_admin():
+        logger.warning(f"[Task][GetById] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看任务信息"
@@ -89,10 +99,12 @@ def get_task_by_id(
     
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
+        logger.warning(f"[Task][GetById] 未找到 | task_id={task_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="任务不存在"
         )
+    logger.info(f"[Task][GetById] 成功 | task_id={task.id}")
     return task
 
 
@@ -105,9 +117,11 @@ def update_task(
     """更新任务信息 - 只有管理员可以更新任务信息"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Task][Update] 请求 | user_id={current_user.id} payload={task_update.model_dump(exclude_none=True)}")
     
     # 权限检查：只有管理员可以更新任务信息
     if not current_user.is_admin():
+        logger.warning(f"[Task][Update] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以更新任务信息"
@@ -119,6 +133,7 @@ def update_task(
     # 查找任务
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
+        logger.warning(f"[Task][Update] 未找到 | task_id={task_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="任务不存在"
@@ -149,6 +164,7 @@ def update_task(
             models.Task.id != task_id
         ).first()
         if existing_task:
+            logger.warning(f"[Task][Update] 名称冲突 | task_id={task_id} name={update_data['name']}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="任务名称已被其他任务使用"
@@ -163,6 +179,7 @@ def update_task(
     
     db.commit()
     db.refresh(task)
+    logger.info(f"[Task][Update] 成功 | task_id={task.id} updated={updated_fields}")
     
     # 记录任务更新日志
     if updated_fields:
@@ -184,9 +201,11 @@ def delete_task(
     """删除任务 - 只有管理员可以删除任务"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Task][Delete] 请求 | user_id={current_user.id} task_id={task_id}")
     
     # 权限检查：只有管理员可以删除任务
     if not current_user.is_admin():
+        logger.warning(f"[Task][Delete] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以删除任务"
@@ -195,6 +214,7 @@ def delete_task(
     # 查找任务
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
+        logger.warning(f"[Task][Delete] 未找到 | task_id={task_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="任务不存在"
@@ -203,6 +223,7 @@ def delete_task(
     # 检查是否有数据文件关联此任务
     data_files_count = db.query(models.DataFile).filter(models.DataFile.task_id == task_id).count()
     if data_files_count > 0:
+        logger.warning(f"[Task][Delete] 关联数据文件阻止删除 | task_id={task_id} count={data_files_count}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"无法删除任务，该任务关联了 {data_files_count} 个数据文件"
@@ -216,6 +237,7 @@ def delete_task(
     
     db.delete(task)
     db.commit()
+    logger.info(f"[Task][Delete] 成功 | task_id={task_id}")
     return {"message": f"任务 {task.name} 已成功删除"}
 
 
@@ -228,6 +250,7 @@ def get_tasks_with_pagination(
     """获取任务列表，支持分页和按ID查询 - 任何已认证用户都可以查看"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Task][Page] 请求 | user_id={current_user.id} filters={{'task_id': { 'set' if bool(getattr(request_data, 'task_id', None)) else 'unset' }, 'name': { 'set' if bool(getattr(request_data, 'name', None)) else 'unset' }}}")
     
     # 权限检查：任何已认证的用户都可以查看任务信息
     # 移除管理员限制，允许所有数据库中的用户访问
@@ -246,6 +269,7 @@ def get_tasks_with_pagination(
         
         # 获取总数（用于分页信息）
         total_count = query.count()
+        logger.info(f"[Task][Page] 查询完成 | total_count={total_count}")
         
         # 按ID正序排列
         query = query.order_by(models.Task.id.asc())
@@ -253,6 +277,7 @@ def get_tasks_with_pagination(
         # 应用分页
         offset = (request_data.page - 1) * request_data.page_size
         tasks = query.offset(offset).limit(request_data.page_size).all()
+        logger.info(f"[Task][Page] 分页 | page={request_data.page} size={request_data.page_size} page_count={len(tasks)}")
         
         # 构建响应数据
         result = []
@@ -273,7 +298,7 @@ def get_tasks_with_pagination(
         # 计算分页信息
         total_pages = (total_count + request_data.page_size - 1) // request_data.page_size
         
-        return {
+        resp = {
             "tasks": result,
             "pagination": {
                 "current_page": request_data.page,
@@ -284,8 +309,11 @@ def get_tasks_with_pagination(
                 "has_prev": request_data.page > 1
             }
         }
+        logger.info(f"[Task][Page] 成功 | current_page={request_data.page} total_pages={total_pages}")
+        return resp
         
     except Exception as e:
+        logger.exception(f"[Task][Page] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取任务信息时发生错误: {str(e)}"

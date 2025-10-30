@@ -4,6 +4,7 @@ from typing import List, Optional
 from common.database import get_db
 from common import models, schemas
 from router.user.auth import get_current_user
+from loguru import logger
 
 router = APIRouter()
 
@@ -17,9 +18,11 @@ def create_label(
     """创建标签 - 只有管理员可以创建标签"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Label][Create] 请求 | user_id={getattr(current_user, 'id', None)} name={label.name}")
     
     # 权限检查：只有管理员可以创建标签
     if not current_user.is_admin():
+        logger.warning(f"[Label][Create] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以创建标签"
@@ -28,6 +31,7 @@ def create_label(
     # 检查标签名称是否已存在
     existing_label = db.query(models.Label).filter(models.Label.name == label.name).first()
     if existing_label:
+        logger.warning(f"[Label][Create] 名称已存在 | name={label.name}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="标签名称已存在"
@@ -40,6 +44,7 @@ def create_label(
     db.add(db_label)
     db.commit()
     db.refresh(db_label)
+    logger.info(f"[Label][Create] 成功 | label_id={db_label.id}")
     return db_label
 
 
@@ -51,15 +56,18 @@ def get_all_labels(
     """获取所有标签列表 - 只有管理员可以查看所有标签"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Label][ListAll] 请求 | user_id={current_user.id}")
     
     # 权限检查：只有管理员可以查看所有标签
     if not current_user.is_admin():
+        logger.warning(f"[Label][ListAll] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看所有标签"
         )
     
     labels = db.query(models.Label).order_by(models.Label.id.asc()).all()
+    logger.info(f"[Label][ListAll] 成功 | count={len(labels)}")
     return labels
 
 
@@ -72,9 +80,11 @@ def get_label_by_id(
     """根据ID获取标签信息 - 只有管理员可以查看标签信息"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Label][GetById] 请求 | user_id={current_user.id} label_id={label_id}")
     
     # 权限检查：只有管理员可以查看标签信息
     if not current_user.is_admin():
+        logger.warning(f"[Label][GetById] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以查看标签信息"
@@ -82,10 +92,12 @@ def get_label_by_id(
     
     label = db.query(models.Label).filter(models.Label.id == label_id).first()
     if not label:
+        logger.warning(f"[Label][GetById] 未找到 | label_id={label_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="标签不存在"
         )
+    logger.info(f"[Label][GetById] 成功 | label_id={label.id}")
     return label
 
 
@@ -98,9 +110,11 @@ def update_label(
     """更新标签信息 - 只有管理员可以更新标签信息"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Label][Update] 请求 | user_id={current_user.id} payload={label_update.model_dump(exclude_none=True)}")
     
     # 权限检查：只有管理员可以更新标签信息
     if not current_user.is_admin():
+        logger.warning(f"[Label][Update] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以更新标签信息"
@@ -112,6 +126,7 @@ def update_label(
     # 查找标签
     label = db.query(models.Label).filter(models.Label.id == label_id).first()
     if not label:
+        logger.warning(f"[Label][Update] 未找到 | label_id={label_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="标签不存在"
@@ -142,6 +157,7 @@ def update_label(
             models.Label.id != label_id
         ).first()
         if existing_label:
+            logger.warning(f"[Label][Update] 名称冲突 | label_id={label_id} name={update_data['name']}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="标签名称已被其他标签使用"
@@ -156,6 +172,7 @@ def update_label(
     
     db.commit()
     db.refresh(label)
+    logger.info(f"[Label][Update] 成功 | label_id={label.id} updated={updated_fields}")
     
     # 记录标签更新日志
     if updated_fields:
@@ -177,9 +194,11 @@ def delete_label(
     """删除标签 - 只有管理员可以删除标签"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Label][Delete] 请求 | user_id={current_user.id} label_id={label_id}")
     
     # 权限检查：只有管理员可以删除标签
     if not current_user.is_admin():
+        logger.warning(f"[Label][Delete] 拒绝 | 非管理员 user_id={current_user.id}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="只有管理员可以删除标签"
@@ -188,6 +207,7 @@ def delete_label(
     # 查找标签
     label = db.query(models.Label).filter(models.Label.id == label_id).first()
     if not label:
+        logger.warning(f"[Label][Delete] 未找到 | label_id={label_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="标签不存在"
@@ -196,6 +216,7 @@ def delete_label(
     # 检查是否有数据文件标签映射关联此标签
     data_file_labels_count = db.query(models.DataFileLabel).filter(models.DataFileLabel.label_id == label_id).count()
     if data_file_labels_count > 0:
+        logger.warning(f"[Label][Delete] 关联映射阻止删除 | label_id={label_id} count={data_file_labels_count}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"无法删除标签，该标签关联了 {data_file_labels_count} 个数据文件标签映射"
@@ -210,6 +231,7 @@ def delete_label(
     
     db.delete(label)
     db.commit()
+    logger.info(f"[Label][Delete] 成功 | label_id={label_id}")
     return {"message": f"标签 {label.name} 已成功删除"}
 
 
@@ -222,6 +244,7 @@ def get_labels_with_pagination(
     """获取标签列表，支持分页和按ID查询 - 任何已认证用户都可以查看"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
+    logger.info(f"[Label][Page] 请求 | user_id={current_user.id} filters={{'label_id': { 'set' if bool(getattr(request_data, 'label_id', None)) else 'unset' }, 'name': { 'set' if bool(getattr(request_data, 'name', None)) else 'unset' }}}")
     
     # 权限检查：任何已认证的用户都可以查看标签信息
     # 移除管理员限制，允许所有数据库中的用户访问
@@ -240,6 +263,7 @@ def get_labels_with_pagination(
         
         # 获取总数（用于分页信息）
         total_count = query.count()
+        logger.info(f"[Label][Page] 查询完成 | total_count={total_count}")
         
         # 按ID正序排列
         query = query.order_by(models.Label.id.asc())
@@ -247,6 +271,7 @@ def get_labels_with_pagination(
         # 应用分页
         offset = (request_data.page - 1) * request_data.page_size
         labels = query.offset(offset).limit(request_data.page_size).all()
+        logger.info(f"[Label][Page] 分页 | page={request_data.page} size={request_data.page_size} page_count={len(labels)}")
         
         # 构建响应数据
         result = []
@@ -280,6 +305,7 @@ def get_labels_with_pagination(
         }
         
     except Exception as e:
+        logger.exception(f"[Label][Page] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取标签信息时发生错误: {str(e)}"

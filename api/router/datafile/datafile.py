@@ -19,6 +19,7 @@ from common import models, schemas
 from common.permission_utils import PermissionUtils
 from common.mcap_loader import McapReader
 from router.user.auth import get_current_user
+from loguru import logger
 
 router = APIRouter()
 
@@ -83,15 +84,19 @@ def s3_health(
     # 验证token
     current_user = get_current_user(token, db)
     try:
+        logger.info(f"[S3] 健康检查开始 | bucket={S3_BUCKET_NAME} region={S3_REGION_NAME}")
         s3 = get_s3_client()
         # 校验桶是否可访问（需要对桶有 head 权限）
         s3.head_bucket(Bucket=S3_BUCKET_NAME)
-        return {
+        result = {
             "ok": True,
             "bucket": S3_BUCKET_NAME,
             "region": S3_REGION_NAME
         }
+        logger.info(f"[S3] 健康检查成功 | {result}")
+        return result
     except Exception as e:
+        logger.exception(f"[S3] 健康检查失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"S3连接失败: {str(e)}"
@@ -173,6 +178,7 @@ async def upload_mcap_file(
     try:
         # 读取文件内容
         content = await file.read()
+        logger.info(f"[Upload] 收到上传请求 | task_id={task_id} device_id={device_id} user_id={current_user.id} filename={file.filename} size={len(content)}")
         
         # 生成唯一对象键
         file_extension = os.path.splitext(file.filename)[1]
@@ -202,6 +208,7 @@ async def upload_mcap_file(
         # 上传到 S3
         s3 = get_s3_client()
         s3.put_object(Bucket=S3_BUCKET_NAME, Key=unique_key, Body=content, ContentType='application/octet-stream')
+        logger.info(f"[S3] 上传成功 | key={unique_key} bucket={S3_BUCKET_NAME} duration_ms={duration_ms}")
         download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
         
         # 创建数据文件记录
@@ -233,9 +240,11 @@ async def upload_mcap_file(
             db, current_user.username, file.filename, db_datafile.id, task_id, device_id
         )
         
+        logger.info(f"[Upload] 数据库记录创建成功 | data_file_id={db_datafile.id}")
         return db_datafile
         
     except Exception as e:
+        logger.exception(f"[Upload] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"上传文件时发生错误: {str(e)}"
@@ -449,10 +458,12 @@ def delete_datafile(
     
     # 删除 S3 或本地物理文件
     try:
+        logger.info(f"[Delete] 请求删除 | datafile_id={datafile_id} user_id={current_user.id}")
         if datafile.download_url.startswith("s3://"):
             bucket, key = parse_s3_url(datafile.download_url)
             s3 = get_s3_client()
             s3.delete_object(Bucket=bucket, Key=key)
+            logger.info(f"[S3] 对象删除成功 | bucket={bucket} key={key}")
         else:
             file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
             if os.path.exists(file_path):
@@ -461,7 +472,7 @@ def delete_datafile(
                 except Exception as e:
                     print(f"删除物理文件失败: {e}")
     except Exception as e:
-        print(f"删除存储对象失败: {str(e)}")
+        logger.exception(f"[Delete] 存储对象删除失败: {e}")
     
     # 记录文件删除日志
     from common.operation_log_util import OperationLogUtil
@@ -520,6 +531,7 @@ def download_file(
             obj = s3.get_object(Bucket=bucket, Key=key)
             file_size = obj.get('ContentLength')
             body = obj['Body']
+            logger.info(f"[Download] S3 文件 | datafile_id={datafile_id} key={key} size={file_size}")
 
             def stream_body():
                 chunk_size = 1024 * 1024
@@ -542,6 +554,7 @@ def download_file(
                 }
             )
         except Exception as e:
+            logger.exception(f"[Download] 从S3下载失败: {e}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"从S3下载失败: {str(e)}")
     else:
         # 兼容本地路径（历史数据）
@@ -549,7 +562,7 @@ def download_file(
             file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
         else:
             file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
-        print(f"下载文件路径: {file_path}")
+        logger.info(f"[Download] 本地文件 | path={file_path} datafile_id={datafile_id}")
         if not os.path.exists(file_path):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -603,13 +616,13 @@ def download_files_zip(
     
     datafiles = accessible_datafiles
     
-    print(f"开始处理 {len(datafiles)} 个文件")
+    logger.info(f"[ZIP] 开始处理 | files={len(datafiles)} user_id={current_user.id}")
     
     # 创建ZIP文件（内存优先，超限落盘）
     import io
     
     try:
-        print(f"开始创建ZIP文件，包含 {len(datafiles)} 个文件")  # 调试信息
+        logger.info(f"[ZIP] 创建开始 | files={len(datafiles)}")
         
         # 使用 SpooledTemporaryFile，超过阈值自动落盘
         zip_buffer = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
@@ -617,7 +630,7 @@ def download_files_zip(
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
             s3 = get_s3_client()
             for datafile in datafiles:
-                print(f"添加文件到ZIP: {datafile.file_name} -> {datafile.download_url}")
+                logger.info(f"[ZIP] 添加条目 | name={datafile.file_name} url={datafile.download_url}")
                 try:
                     if datafile.download_url.startswith("s3://"):
                         bucket, key = parse_s3_url(datafile.download_url)
@@ -646,13 +659,13 @@ def download_files_zip(
                                         break
                                     dest.write(chunk)
                         else:
-                            print(f"文件不存在，跳过: {file_path}")
+                            logger.warning(f"[ZIP] 本地文件不存在，跳过 | path={file_path}")
                 except Exception as e:
-                    print(f"添加文件失败，跳过 {datafile.file_name}: {str(e)}")
+                    logger.exception(f"[ZIP] 添加失败，跳过 | name={datafile.file_name} err={e}")
         
         # 获取ZIP文件大小
         zip_size = zip_buffer.tell()
-        print(f"ZIP文件创建完成，大小: {zip_size} 字节")  # 调试信息
+        logger.info(f"[ZIP] 创建完成 | size={zip_size}")
         
         if zip_size == 0:
             raise HTTPException(
@@ -679,7 +692,7 @@ def download_files_zip(
                     break
                 yield chunk
         
-        print(f"准备返回ZIP文件，大小: {zip_size} 字节，文件名: {zip_filename}")  # 调试信息
+        logger.info(f"[ZIP] 返回 | name={zip_filename} size={zip_size}")
         
         # 返回ZIP文件
         return StreamingResponse(
@@ -693,9 +706,7 @@ def download_files_zip(
         )
         
     except Exception as e:
-        print(f"创建ZIP文件时发生错误: {str(e)}")  # 详细错误日志
-        import traceback
-        print(f"错误堆栈: {traceback.format_exc()}")  # 完整错误堆栈
+        logger.exception(f"[ZIP] 失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"创建ZIP文件时发生错误: {str(e)}"

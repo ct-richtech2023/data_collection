@@ -1,4 +1,6 @@
 from loguru import logger
+import os
+from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from starlette.staticfiles import StaticFiles
@@ -16,6 +18,34 @@ app = FastAPI(
     description="",
     version="1.0.0"
 )
+
+# 日志目录与文件配置
+LOG_DIR = "/var/log/data_collection"
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except Exception as e:
+    # 目录不可创建时，继续使用默认控制台输出
+    logger.warning(f"无法创建日志目录 {LOG_DIR}: {e}")
+
+log_path = os.path.join(LOG_DIR, "app.log")
+try:
+    # 清理默认 sink，重新配置控制台与文件双输出
+    logger.remove()
+    logger.add(lambda msg: print(msg, end=""), enqueue=True, backtrace=True, diagnose=False)
+    logger.add(
+        log_path,
+        rotation="200 MB",
+        retention="14 days",
+        compression="zip",
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {process} | {name}:{function}:{line} - {message}"
+    )
+    logger.info(f"日志初始化完成，输出到 {log_path}")
+except Exception as e:
+    logger.warning(f"日志文件无法写入 {log_path}: {e}")
 app.mount('/static', StaticFiles(directory=SwaggerUIFiles.current_dir), name='static')
 app.mount('/uploads', StaticFiles(directory='uploads'), name='uploads')
 
