@@ -10,6 +10,10 @@ import tempfile
 from datetime import datetime
 from mcap.reader import make_reader
 import io
+import boto3
+from botocore.config import Config as BotoConfig
+from urllib.parse import urlparse
+import yaml
 from common.database import get_db
 from common import models, schemas
 from common.permission_utils import PermissionUtils
@@ -22,6 +26,76 @@ router = APIRouter()
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+
+# S3 配置（支持 /etc/data_collection/s3.yaml 与环境变量，环境变量优先）
+S3_CONFIG_FILE = "/etc/data_collection/s3.yaml"
+_S3_CFG = {}
+try:
+    if os.path.exists(S3_CONFIG_FILE):
+        with open(S3_CONFIG_FILE, 'r') as f:
+            _S3_CFG = yaml.safe_load(f) or {}
+except Exception as _e:
+    # 配置文件读取失败不阻断启动，后续仍可用环境变量
+    print(f"读取 {S3_CONFIG_FILE} 失败: {_e}")
+
+def _cfg(name: str, default=None):
+    return os.getenv(name, _S3_CFG.get(name, default))
+
+S3_REGION_NAME = _cfg("S3_REGION_NAME", "us-east-1")
+S3_BUCKET_NAME = _cfg("S3_BUCKET_NAME", None)
+S3_ACCESS_KEY = _cfg("S3_ACCESS_KEY_ID", None)
+S3_SECRET_KEY = _cfg("S3_SECRET_ACCESS_KEY", None)
+
+
+def get_s3_client():
+    if not S3_BUCKET_NAME:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="未配置 S3_BUCKET_NAME")
+    if not (S3_ACCESS_KEY and S3_SECRET_KEY):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="未配置 S3 访问密钥")
+    return boto3.client(
+        "s3",
+        region_name=S3_REGION_NAME,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY
+    )
+
+
+def build_s3_url(bucket: str, key: str) -> str:
+    return f"s3://{bucket}/{key}"
+
+
+def parse_s3_url(s3_url: str):
+    # 支持 s3://bucket/key 形式
+    parsed = urlparse(s3_url)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError("无效的 S3 URL")
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    return bucket, key
+
+
+@router.get("/s3_health")
+def s3_health(
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """S3 健康检查：验证客户端初始化与桶可访问性（head_bucket）。"""
+    # 验证token
+    current_user = get_current_user(token, db)
+    try:
+        s3 = get_s3_client()
+        # 校验桶是否可访问（需要对桶有 head 权限）
+        s3.head_bucket(Bucket=S3_BUCKET_NAME)
+        return {
+            "ok": True,
+            "bucket": S3_BUCKET_NAME,
+            "region": S3_REGION_NAME
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"S3连接失败: {str(e)}"
+        )
 
 
 @router.post("/upload_mcap", response_model=schemas.DataFileOut)
@@ -100,29 +174,35 @@ async def upload_mcap_file(
         # 读取文件内容
         content = await file.read()
         
-        # 生成唯一文件名
+        # 生成唯一对象键
         file_extension = os.path.splitext(file.filename)[1]
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = os.path.join(UPLOAD_DIR, unique_filename)
+        unique_key = f"datafiles/{uuid.uuid4()}{file_extension}"
         
-        # 先保存文件到临时位置，用于解析
-        with open(file_path, "wb") as buffer:
-            buffer.write(content)
-        
-        # 使用 McapReader 获取文件信息
+        # 将内容写入临时文件以便解析 MCAP 时长
+        temp_path = None
         try:
-            mcap_reader = McapReader(file_path)
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            temp_path = tmp.name
+            tmp.write(content)
+            tmp.close()
+            mcap_reader = McapReader(temp_path)
             file_info = mcap_reader.file_info
-            # 将秒转换为毫秒，保留两位小数精度后四舍五入为整数
             duration_ms = int(file_info.duration_sec * 1000)
-            mcap_reader.close()  # 关闭reader释放资源
+            mcap_reader.close()
         except Exception as e:
             print(f"解析MCAP文件信息失败: {e}")
-            # 如果解析失败，使用默认时长 60 秒（60000毫秒）
             duration_ms = 60 * 1000
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
         
-        # 生成下载URL（这里使用相对路径，实际部署时应该使用完整的URL）
-        download_url = f"/uploads/{unique_filename}"
+        # 上传到 S3
+        s3 = get_s3_client()
+        s3.put_object(Bucket=S3_BUCKET_NAME, Key=unique_key, Body=content, ContentType='application/octet-stream')
+        download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
         
         # 创建数据文件记录
         db_datafile = models.DataFile(
@@ -156,9 +236,6 @@ async def upload_mcap_file(
         return db_datafile
         
     except Exception as e:
-        # 如果数据库操作失败，删除已上传的文件
-        if os.path.exists(file_path):
-            os.remove(file_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"上传文件时发生错误: {str(e)}"
@@ -370,14 +447,21 @@ def delete_datafile(
         db.query(models.DataFileLabel).filter(models.DataFileLabel.data_file_id == datafile_id).delete()
         print(f"已删除 {data_file_labels_count} 个关联的标签映射")
     
-    # 删除物理文件
-    file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-        except Exception as e:
-            # 记录错误但不阻止数据库删除
-            print(f"删除物理文件失败: {e}")
+    # 删除 S3 或本地物理文件
+    try:
+        if datafile.download_url.startswith("s3://"):
+            bucket, key = parse_s3_url(datafile.download_url)
+            s3 = get_s3_client()
+            s3.delete_object(Bucket=bucket, Key=key)
+        else:
+            file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    print(f"删除物理文件失败: {e}")
+    except Exception as e:
+        print(f"删除存储对象失败: {str(e)}")
     
     # 记录文件删除日志
     from common.operation_log_util import OperationLogUtil
@@ -422,39 +506,65 @@ def download_file(
             detail="您没有访问该文件的权限"
         )
     
-    # 构建文件路径
-    if datafile.download_url.startswith("/uploads/"):
-        file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
-    else:
-        file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
-    
-    print(f"下载文件路径: {file_path}")  # 调试信息
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"文件不存在于服务器上: {file_path}"
-        )
-    
     # 记录下载日志
     from common.operation_log_util import OperationLogUtil
     OperationLogUtil.log_file_download(
         db, current_user.username, 1, [datafile_id]
     )
-    
-    # 获取文件大小
-    file_size = os.path.getsize(file_path)
-    print(f"下载文件: {datafile.file_name}, 大小: {file_size} 字节")  # 调试信息
-    
-    return FileResponse(
-        path=file_path,
-        filename=datafile.file_name,
-        media_type='application/octet-stream',
-        headers={
-            "Content-Length": str(file_size),
-            "Cache-Control": "no-cache"
-        }
-    )
+
+    # 基于 S3 或本地的下载
+    if datafile.download_url.startswith("s3://"):
+        try:
+            bucket, key = parse_s3_url(datafile.download_url)
+            s3 = get_s3_client()
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            file_size = obj.get('ContentLength')
+            body = obj['Body']
+
+            def stream_body():
+                chunk_size = 1024 * 1024
+                while True:
+                    chunk = body.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+
+            headers = {"Cache-Control": "no-cache"}
+            if file_size is not None:
+                headers["Content-Length"] = str(file_size)
+
+            return StreamingResponse(
+                stream_body(),
+                media_type='application/octet-stream',
+                headers={
+                    **headers,
+                    "Content-Disposition": f"attachment; filename={datafile.file_name}"
+                }
+            )
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"从S3下载失败: {str(e)}")
+    else:
+        # 兼容本地路径（历史数据）
+        if datafile.download_url.startswith("/uploads/"):
+            file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+        else:
+            file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
+        print(f"下载文件路径: {file_path}")
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"文件不存在于服务器上: {file_path}"
+            )
+        file_size = os.path.getsize(file_path)
+        return FileResponse(
+            path=file_path,
+            filename=datafile.file_name,
+            media_type='application/octet-stream',
+            headers={
+                "Content-Length": str(file_size),
+                "Cache-Control": "no-cache"
+            }
+        )
 
 
 @router.post("/download_files_zip")
@@ -493,50 +603,52 @@ def download_files_zip(
     
     datafiles = accessible_datafiles
     
-    # 检查文件是否存在
-    missing_files = []
-    valid_files = []
-    print(f"开始处理 {len(datafiles)} 个文件")  # 调试信息
+    print(f"开始处理 {len(datafiles)} 个文件")
     
-    for datafile in datafiles:
-        print(f"处理文件: {datafile.file_name}, URL: {datafile.download_url}")  # 调试信息
-        
-        # 处理文件路径，确保正确构建绝对路径
-        if datafile.download_url.startswith("/uploads/"):
-            file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
-        else:
-            file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
-        
-        print(f"检查文件路径: {file_path}")  # 调试信息
-        print(f"文件是否存在: {os.path.exists(file_path)}")  # 调试信息
-        
-        if os.path.exists(file_path):
-            valid_files.append((datafile, file_path))
-            print(f"文件添加成功: {datafile.file_name}")  # 调试信息
-        else:
-            missing_files.append(datafile.file_name)
-            print(f"文件不存在: {file_path}")  # 调试信息
-    
-    if not valid_files:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="所有文件都不存在于服务器上"
-        )
-    
-    # 创建ZIP文件在内存中
+    # 创建ZIP文件（内存优先，超限落盘）
     import io
     
     try:
-        print(f"开始创建ZIP文件，包含 {len(valid_files)} 个文件")  # 调试信息
+        print(f"开始创建ZIP文件，包含 {len(datafiles)} 个文件")  # 调试信息
         
-        # 创建内存中的ZIP文件
-        zip_buffer = io.BytesIO()
+        # 使用 SpooledTemporaryFile，超过阈值自动落盘
+        zip_buffer = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for datafile, file_path in valid_files:
-                print(f"添加文件到ZIP: {datafile.file_name} -> {file_path}")  # 调试信息
-                # 使用原始文件名作为ZIP内的文件名
-                zipf.write(file_path, datafile.file_name)
+            s3 = get_s3_client()
+            for datafile in datafiles:
+                print(f"添加文件到ZIP: {datafile.file_name} -> {datafile.download_url}")
+                try:
+                    if datafile.download_url.startswith("s3://"):
+                        bucket, key = parse_s3_url(datafile.download_url)
+                        obj = s3.get_object(Bucket=bucket, Key=key)
+                        # 流式写入 ZIP 内条目
+                        with zipf.open(datafile.file_name, 'w') as dest:
+                            body = obj['Body']
+                            chunk_size = 1024 * 1024
+                            while True:
+                                chunk = body.read(chunk_size)
+                                if not chunk:
+                                    break
+                                dest.write(chunk)
+                    else:
+                        # 兼容本地路径（历史数据）
+                        if datafile.download_url.startswith("/uploads/"):
+                            file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+                        else:
+                            file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
+                        if os.path.exists(file_path):
+                            # 本地文件用流式复制到 ZIP
+                            with open(file_path, 'rb') as src, zipf.open(datafile.file_name, 'w') as dest:
+                                while True:
+                                    chunk = src.read(1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    dest.write(chunk)
+                        else:
+                            print(f"文件不存在，跳过: {file_path}")
+                except Exception as e:
+                    print(f"添加文件失败，跳过 {datafile.file_name}: {str(e)}")
         
         # 获取ZIP文件大小
         zip_size = zip_buffer.tell()
@@ -549,12 +661,12 @@ def download_files_zip(
             )
         
         # 生成ZIP文件名
-        zip_filename = f"datafiles_{len(valid_files)}_files.zip"
+        zip_filename = f"datafiles_{len(datafiles)}_files.zip"
         
         # 创建文件下载操作日志
         from common.operation_log_util import OperationLogUtil
         OperationLogUtil.log_file_download(
-            db, current_user.username, len(valid_files), datafile_ids
+            db, current_user.username, len(datafiles), datafile_ids
         )
         
         # 改进的生成器函数，分块读取数据
