@@ -6,14 +6,14 @@
 set -e  # 遇到错误立即退出
 
 # 数据库连接配置
-DB_HOST="192.168.2.131"
+DB_HOST="127.0.0.1"
 DB_PORT="5432"
 DB_USER="postgres"
 DB_PASSWORD="richtech"
 DB_NAME="filesvc"
 
 # 项目根目录
-PROJECT_ROOT="/home/ubuntu/code/richtech/data_collection"
+PROJECT_ROOT="/home/ec2-user/data_collection"
 
 echo "=========================================="
 echo "开始创建数据库表结构"
@@ -41,7 +41,29 @@ fi
 
 # 检查数据库连接
 echo "检查数据库连接..."
-PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "SELECT 1;" > /dev/null
+
+# 设置 psql 调用方式：本机 psql 或容器内 psql（filesvc-pg）
+USE_DOCKER_PSQL=0
+if ! command -v psql &> /dev/null; then
+    if docker ps --format '{{.Names}}' | grep -q '^filesvc-pg$'; then
+        echo "未检测到本机 psql，将使用容器 filesvc-pg 内的 psql 执行"
+        USE_DOCKER_PSQL=1
+    else
+        echo "错误: 未找到 psql，且未检测到容器 filesvc-pg"
+        echo "请安装客户端或先启动数据库容器后重试"
+        exit 1
+    fi
+fi
+
+run_psql() {
+    if [ "$USE_DOCKER_PSQL" -eq 1 ]; then
+        docker exec -e PGPASSWORD="$DB_PASSWORD" -i filesvc-pg psql "$@"
+    else
+        PGPASSWORD="$DB_PASSWORD" psql "$@"
+    fi
+}
+
+run_psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "SELECT 1;" > /dev/null
 
 if [ $? -ne 0 ]; then
     echo "❌ 数据库连接失败，请先运行 create_database.sh 创建数据库"
@@ -52,7 +74,7 @@ echo "✅ 数据库连接成功"
 
 # 检查是否已有表存在
 echo "检查现有表..."
-TABLE_COUNT=$(PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -tAc "
+TABLE_COUNT=$(run_psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -tAc "
 SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name != 'alembic_version';
 " 2>/dev/null || echo "0")
 
@@ -62,7 +84,7 @@ if [ "$TABLE_COUNT" -gt 0 ]; then
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         echo "删除现有表..."
-        PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "
+        run_psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "
 DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 GRANT ALL ON SCHEMA public TO $DB_USER;
@@ -76,6 +98,8 @@ fi
 
 # 运行 Alembic 迁移
 echo "运行数据库迁移..."
+# 将脚本中的连接参数导出为 Alembic/应用读取的 DATABASE_URL，确保与上面的连接一致
+export DATABASE_URL="postgresql://$DB_USER:$DB_PASSWORD@$DB_HOST:$DB_PORT/$DB_NAME"
 alembic upgrade head
 
 if [ $? -eq 0 ]; then
@@ -87,7 +111,7 @@ fi
 
 # 验证表创建
 echo "验证表创建..."
-TABLE_LIST=$(PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -tAc "
+TABLE_LIST=$(run_psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -tAc "
 SELECT string_agg(table_name, ', ' ORDER BY table_name) 
 FROM information_schema.tables 
 WHERE table_schema = 'public' 
@@ -99,7 +123,7 @@ echo "创建的表: $TABLE_LIST"
 # 显示表结构统计
 echo ""
 echo "表结构统计:"
-PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "
+run_psql -h $DB_HOST -p $DB_PORT -U $DB_USER -d $DB_NAME -c "
 SELECT 
     tablename as \"表名\",
     COUNT(*) as \"字段数\"

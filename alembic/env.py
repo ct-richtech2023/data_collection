@@ -24,6 +24,10 @@ from api.common.database import Base
 from api.common import models  # 导入所有模型
 
 target_metadata = Base.metadata
+# 优先使用环境变量 DATABASE_URL 覆盖 sqlalchemy.url，便于脚本/部署注入
+db_url = os.getenv("DATABASE_URL")
+if db_url:
+    config.set_main_option("sqlalchemy.url", db_url)
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

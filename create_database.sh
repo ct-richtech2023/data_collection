@@ -16,12 +16,18 @@ echo "=========================================="
 echo "开始创建数据库: $DB_NAME"
 echo "=========================================="
 
-# 检查 PostgreSQL 客户端是否安装
+# 检查 PostgreSQL 客户端是否安装；如未安装，尝试使用容器内 psql
 if ! command -v psql &> /dev/null; then
-    echo "错误: psql 命令未找到，请先安装 PostgreSQL 客户端"
-    echo "Ubuntu/Debian: sudo apt-get install postgresql-client"
-    echo "CentOS/RHEL: sudo yum install postgresql"
-    exit 1
+    if docker ps --format '{{.Names}}' | grep -q '^filesvc-pg$'; then
+        echo "未检测到本机 psql，将使用容器 filesvc-pg 内的 psql 执行后续命令"
+        psql() { docker exec -i filesvc-pg psql "$@"; }
+    else
+        echo "错误: psql 命令未找到，且未检测到容器 filesvc-pg"
+        echo "Ubuntu/Debian: sudo apt-get install postgresql-client"
+        echo "CentOS/RHEL: sudo yum install postgresql"
+        echo "或先启动数据库容器（容器名需为 filesvc-pg），再重试执行本脚本"
+        exit 1
+    fi
 fi
 
 # 检查数据库是否已存在
