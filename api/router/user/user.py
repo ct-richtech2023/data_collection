@@ -2,8 +2,8 @@ from loguru import logger
 from fastapi import FastAPI, Depends, HTTPException, status, Header, APIRouter
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from common.database import Base, engine, get_db
-from common import models, schemas
+from api.common.database import Base, engine, get_db
+from api.common import models, schemas
 from .auth import hash_password, authenticate_user, create_access_token, get_current_user
 
 router = APIRouter()
@@ -45,7 +45,7 @@ def register(user_in: schemas.User, token: str = Header(..., description="JWT to
         db.refresh(user)
         
         # 创建用户注册操作日志
-        from common.operation_log_util import OperationLogUtil
+        from api.common.operation_log_util import OperationLogUtil
         OperationLogUtil.log_user_register(
             db, current_user.username, user_in.username, user_in.permission_level
         )

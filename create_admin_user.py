@@ -15,12 +15,7 @@ sys.path.insert(0, project_root)
 
 from api.common.database import SessionLocal
 from api.common import models
-
-def hash_password(password: str) -> str:
-    """简单的密码哈希函数"""
-    import bcrypt
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+from api.router.user.auth import hash_password  # 统一使用应用内的哈希策略（bcrypt_sha256 优先）
 
 def create_admin_user():
     """创建管理员用户"""

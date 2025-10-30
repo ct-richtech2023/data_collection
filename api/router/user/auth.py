@@ -3,13 +3,16 @@ from fastapi import HTTPException, status
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
-from common import models
+from api.common import models
 
 SECRET_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt"],  # 兼容长口令，保留旧 bcrypt
+    deprecated="auto",
+)
 
 
 def hash_password(password: str) -> str:
@@ -17,6 +20,7 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
+    # 保留给可能的直接调用者；不做自动升级
     return pwd_context.verify(plain, hashed)
 
 
@@ -29,8 +33,20 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
 
 def authenticate_user(db: Session, username: str, password: str) -> models.User | None:
     user = db.query(models.User).filter(models.User.username == username).first()
-    if not user or not verify_password(password, user.password):
+    if not user:
         return None
+    ok, new_hash = pwd_context.verify_and_update(password, user.password)
+    if not ok:
+        return None
+    # 若命中旧算法，返回了升级后的哈希，写回数据库以完成平滑迁移
+    if new_hash:
+        user.password = new_hash
+        db.add(user)
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            # 即便写回失败，鉴权已通过，仍返回用户
     return user
 
 

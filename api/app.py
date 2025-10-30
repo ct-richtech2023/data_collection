@@ -1,9 +1,11 @@
 from loguru import logger
 import os
+import sys
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from starlette.staticfiles import StaticFiles
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # 确保可导入顶级包 api
 from router.user import router as user_router
 from router.device import router as device_router
 from router.operation import router as operation_router
