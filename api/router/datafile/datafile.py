@@ -360,6 +360,15 @@ def update_datafile(
                 detail="文件时长不能为负数"
             )
     
+    # 验证任务是否存在
+    if "task_id" in update_data and update_data["task_id"] is not None:
+        task = db.query(models.Task).filter(models.Task.id == update_data["task_id"]).first()
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="指定的任务不存在"
+            )
+    
     # 验证设备是否存在
     if "device_id" in update_data and update_data["device_id"] is not None:
         device = db.query(models.Device).filter(models.Device.id == update_data["device_id"]).first()

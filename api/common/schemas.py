@@ -236,6 +236,7 @@ class DataFileCreate(StrictModel):
 class DataFileUpdate(StrictModel):
     id: int = Field(..., description="数据文件ID")
     file_name: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    task_id: Optional[int] = Field(default=None, description="任务ID，可选")
     device_id: Optional[int] = Field(default=None)
     label_ids: Optional[List[int]] = Field(default=None, description="标签ID列表，可选")
 
