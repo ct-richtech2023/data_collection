@@ -33,6 +33,14 @@ if not os.path.exists(UPLOAD_DIR):
 # 格式: {upload_task_id: UploadProgress}
 upload_tasks: dict = {}
 
+# 下载任务状态存储（内存字典，key: download_task_id, value: DownloadProgress）
+# 格式: {download_task_id: DownloadProgress}
+download_tasks: dict = {}
+
+# 下载文件路径存储（用于下载后清理，key: download_task_id, value: zip_file_path）
+# 格式: {download_task_id: zip_file_path}
+download_file_paths: dict = {}
+
 # S3 配置（支持 /etc/data_collection/s3.yaml 与环境变量，环境变量优先）
 S3_CONFIG_FILE = "/etc/data_collection/s3.yaml"
 _S3_CFG = {}
@@ -134,7 +142,7 @@ async def upload_mcap(
     
     # 权限检查：检查上传操作权限
     if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "upload"):
-        raise HTTPException(
+               raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="您没有文件上传权限"
         )
@@ -261,6 +269,17 @@ def _update_progress(upload_task_id: str, **kwargs):
                 setattr(progress, key, value)
         progress.update_time = datetime.now()
         upload_tasks[upload_task_id] = progress
+
+
+def _update_download_progress(download_task_id: str, **kwargs):
+    """更新下载进度"""
+    if download_task_id in download_tasks:
+        progress = download_tasks[download_task_id]
+        for key, value in kwargs.items():
+            if hasattr(progress, key):
+                setattr(progress, key, value)
+        progress.update_time = datetime.now()
+        download_tasks[download_task_id] = progress
 
 
 def _process_single_mcap_with_progress_background(
@@ -1610,13 +1629,17 @@ def download_file(
         )
 
 
-@router.post("/download_files_zip")
+@router.post("/download_files_zip", response_model=schemas.DownloadResponse)
 def download_files_zip(
+    background_tasks: BackgroundTasks,
     datafile_ids: List[int],
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """下载多个数据文件打包成ZIP - 需要设备权限和下载操作权限"""
+    """下载多个数据文件打包成ZIP - 需要设备权限和下载操作权限
+    
+    立即返回下载任务ID，文件打包在后台异步执行，可通过 /download_status 接口查询实时进度
+    """
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
@@ -1646,101 +1669,401 @@ def download_files_zip(
     
     datafiles = accessible_datafiles
     
-    logger.info(f"[ZIP] 开始处理 | files={len(datafiles)} user_id={current_user.id}")
+    # 生成下载任务ID
+    download_task_id = str(uuid.uuid4())
     
-    # 创建ZIP文件（内存优先，超限落盘）
-    import io
+    # 初始化进度信息
+    progress = schemas.DownloadProgress(
+        download_task_id=download_task_id,
+        total_files=len(datafiles),
+        processed_files=0,
+        current_file=None,
+        progress_percent=0.0,
+        status="processing",
+        message="下载任务已创建，等待处理...",
+        s3_download_percent=0.0,
+        zip_pack_percent=0.0,
+        start_time=datetime.now(),
+        update_time=datetime.now()
+    )
     
+    # 存储到内存字典
+    download_tasks[download_task_id] = progress
+    
+    # 保存用户和文件信息用于后台任务
+    user_id = current_user.id
+    username = current_user.username
+    
+    # 准备文件信息（序列化为可传递的格式）
+    file_info_list = []
+    for df in datafiles:
+        file_info_list.append({
+            "id": df.id,
+            "file_name": df.file_name,
+            "download_url": df.download_url
+        })
+    
+    # 添加后台任务
+    background_tasks.add_task(
+        _process_download_zip_background,
+        file_info_list=file_info_list,
+        user_id=user_id,
+        username=username,
+        datafile_ids=datafile_ids,
+        download_task_id=download_task_id
+    )
+    
+    # 立即返回任务ID
+    return schemas.DownloadResponse(
+        download_task_id=download_task_id,
+        message="下载任务已启动，请使用 download_task_id 查询实时进度"
+    )
+
+
+def _process_download_zip_background(
+    file_info_list: List[dict],
+    user_id: int,
+    username: str,
+    datafile_ids: List[int],
+    download_task_id: str
+):
+    """后台任务：处理ZIP文件下载（从S3拉取文件并打包，带进度更新）"""
+    from common.database import SessionLocal
+    
+    db = SessionLocal()
     try:
-        logger.info(f"[ZIP] 创建开始 | files={len(datafiles)}")
+        _update_download_progress(
+            download_task_id,
+            progress_percent=5.0,
+            message="开始准备文件..."
+        )
         
-        # 使用 SpooledTemporaryFile，超过阈值自动落盘
-        zip_buffer = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
+        logger.info(f"[Download ZIP] 后台任务开始 | files={len(file_info_list)} user_id={user_id}")
         
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # 直接创建本地ZIP文件路径
+        zip_filename = f"datafiles_{len(file_info_list)}_files_{download_task_id[:8]}.zip"
+        temp_zip_path = os.path.join(UPLOAD_DIR, zip_filename)
+        
+        total_files = len(file_info_list)
+        
+        # S3下载阶段占85%，打包阶段占10%，完成占5%
+        s3_download_start = 5.0
+        s3_download_end = 90.0
+        zip_pack_start = 90.0
+        zip_pack_end = 95.0
+        
+        # 直接打开本地ZIP文件进行写入
+        with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             s3 = get_s3_client()
-            for datafile in datafiles:
-                logger.info(f"[ZIP] 添加条目 | name={datafile.file_name} url={datafile.download_url}")
+            
+            # 阶段1：从S3下载文件并写入ZIP（85%）
+            for idx, file_info in enumerate(file_info_list, 1):
+                file_name = file_info['file_name']
+                download_url = file_info['download_url']
+                
+                # 更新当前处理的文件
+                file_progress_start = s3_download_start + (s3_download_end - s3_download_start) * (idx - 1) / total_files
+                file_progress_end = s3_download_start + (s3_download_end - s3_download_start) * idx / total_files
+                
+                _update_download_progress(
+                    download_task_id,
+                    current_file=file_name,
+                    progress_percent=file_progress_start,
+                    message=f"正在从S3下载第 {idx}/{total_files} 个文件: {file_name}..."
+                )
+                
                 try:
-                    if datafile.download_url.startswith("s3://"):
-                        bucket, key = parse_s3_url(datafile.download_url)
+                    if download_url.startswith("s3://"):
+                        bucket, key = parse_s3_url(download_url)
                         obj = s3.get_object(Bucket=bucket, Key=key)
-                        # 流式写入 ZIP 内条目
-                        with zipf.open(datafile.file_name, 'w') as dest:
-                            body = obj['Body']
-                            chunk_size = 1024 * 1024
+                        file_size = obj.get('ContentLength', 0)
+                        body = obj['Body']
+                        
+                        # 创建进度跟踪
+                        downloaded_bytes = 0
+                        last_update_bytes = 0
+                        update_threshold = max(1024 * 1024, file_size // 100) if file_size > 0 else 1024 * 1024
+                        
+                        with zipf.open(file_name, 'w') as dest:
+                            chunk_size = 1024 * 1024  # 1MB
                             while True:
                                 chunk = body.read(chunk_size)
                                 if not chunk:
                                     break
                                 dest.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                
+                                # 更新S3下载进度
+                                if downloaded_bytes - last_update_bytes >= update_threshold or downloaded_bytes >= file_size:
+                                    if file_size > 0:
+                                        s3_percent = (downloaded_bytes / file_size) * 100.0
+                                        file_progress = file_progress_start + (file_progress_end - file_progress_start) * (downloaded_bytes / file_size)
+                                        _update_download_progress(
+                                            download_task_id,
+                                            progress_percent=file_progress,
+                                            s3_download_percent=s3_percent,
+                                            message=f"正在从S3下载第 {idx}/{total_files} 个文件: {file_name}... {downloaded_bytes}/{file_size} 字节 ({s3_percent:.1f}%)"
+                                        )
+                                    last_update_bytes = downloaded_bytes
+                        
+                        # 文件下载完成
+                        _update_download_progress(
+                            download_task_id,
+                            progress_percent=file_progress_end,
+                            s3_download_percent=100.0,
+                            message=f"S3下载完成: {file_name}"
+                        )
+                        
                     else:
                         # 兼容本地路径（历史数据）
-                        if datafile.download_url.startswith("/uploads/"):
-                            file_path = datafile.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+                        if download_url.startswith("/uploads/"):
+                            file_path = download_url.replace("/uploads/", UPLOAD_DIR + "/")
                         else:
-                            file_path = os.path.join(UPLOAD_DIR, os.path.basename(datafile.download_url))
+                            file_path = os.path.join(UPLOAD_DIR, os.path.basename(download_url))
+                        
                         if os.path.exists(file_path):
-                            # 本地文件用流式复制到 ZIP
-                            with open(file_path, 'rb') as src, zipf.open(datafile.file_name, 'w') as dest:
+                            file_size = os.path.getsize(file_path)
+                            with open(file_path, 'rb') as src, zipf.open(file_name, 'w') as dest:
+                                copied_bytes = 0
                                 while True:
                                     chunk = src.read(1024 * 1024)
                                     if not chunk:
                                         break
                                     dest.write(chunk)
+                                    copied_bytes += len(chunk)
+                                    
+                                    # 更新本地文件复制进度
+                                    if file_size > 0:
+                                        local_percent = (copied_bytes / file_size) * 100.0
+                                        file_progress = file_progress_start + (file_progress_end - file_progress_start) * (copied_bytes / file_size)
+                                        _update_download_progress(
+                                            download_task_id,
+                                            progress_percent=file_progress,
+                                            s3_download_percent=local_percent,
+                                            message=f"正在复制第 {idx}/{total_files} 个本地文件: {file_name}... {copied_bytes}/{file_size} 字节 ({local_percent:.1f}%)"
+                                        )
+                            
+                            _update_download_progress(
+                                download_task_id,
+                                progress_percent=file_progress_end,
+                                s3_download_percent=100.0,
+                                message=f"本地文件复制完成: {file_name}"
+                            )
                         else:
-                            logger.warning(f"[ZIP] 本地文件不存在，跳过 | path={file_path}")
+                            logger.warning(f"[Download ZIP] 本地文件不存在，跳过 | path={file_path}")
+                            _update_download_progress(
+                                download_task_id,
+                                progress_percent=file_progress_end,
+                                message=f"跳过：本地文件不存在 - {file_name}"
+                            )
+                    
+                    # 更新已处理文件数
+                    _update_download_progress(
+                        download_task_id,
+                        processed_files=idx
+                    )
+                    
                 except Exception as e:
-                    logger.exception(f"[ZIP] 添加失败，跳过 | name={datafile.file_name} err={e}")
-        
-        # 获取ZIP文件大小
-        zip_size = zip_buffer.tell()
-        logger.info(f"[ZIP] 创建完成 | size={zip_size}")
-        
-        if zip_size == 0:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="ZIP文件创建失败，文件大小为0"
+                    logger.exception(f"[Download ZIP] 处理文件失败: {file_name}, 错误: {e}")
+                    # 更新进度，继续处理下一个文件
+                    _update_download_progress(
+                        download_task_id,
+                        progress_percent=file_progress_end,
+                        message=f"文件处理失败: {file_name} - {str(e)}"
+                    )
+                    continue
+            
+            # 阶段2：完成ZIP打包（5%）
+            # ZIP文件在写入过程中已经实时打包，这里主要是状态更新
+            _update_download_progress(
+                download_task_id,
+                progress_percent=zip_pack_start,
+                zip_pack_percent=0.0,
+                message="正在完成ZIP打包..."
             )
         
-        # 生成ZIP文件名
-        zip_filename = f"datafiles_{len(datafiles)}_files.zip"
+        # ZIP文件已经写入完成，获取文件大小
+        if os.path.exists(temp_zip_path):
+            zip_size = os.path.getsize(temp_zip_path)
+        else:
+            zip_size = 0
+        
+        if zip_size == 0:
+            _update_download_progress(
+                download_task_id,
+                status="failed",
+                progress_percent=0.0,
+                message="ZIP文件创建失败，文件大小为0"
+            )
+            logger.error(f"[Download ZIP] ZIP文件创建失败，文件大小为0")
+            return
+        
+        _update_download_progress(
+            download_task_id,
+            progress_percent=zip_pack_end,
+            zip_pack_percent=100.0,
+            message=f"ZIP打包完成，文件大小: {zip_size / (1024 * 1024):.2f} MB"
+        )
+        
+        # 阶段3：生成下载链接（5%）
+        _update_download_progress(
+            download_task_id,
+            progress_percent=95.0,
+            message="正在生成下载链接..."
+        )
+        
+        # 生成临时下载链接
+        temp_download_url = f"/downloads/{zip_filename}"
+        
+        # 保存文件路径，用于下载后清理
+        download_file_paths[download_task_id] = temp_zip_path
         
         # 创建文件下载操作日志
         from common.operation_log_util import OperationLogUtil
         OperationLogUtil.log_file_download(
-            db, current_user.username, len(datafiles), datafile_ids
+            db, username, len(file_info_list), datafile_ids
         )
         
-        # 改进的生成器函数，分块读取数据
-        def generate_zip():
-            zip_buffer.seek(0)  # 确保读取位置是从头开始
-            chunk_size = 1024 * 1024  # 1MB chunks
-            while True:
-                chunk = zip_buffer.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
-        
-        logger.info(f"[ZIP] 返回 | name={zip_filename} size={zip_size}")
-        
-        # 返回ZIP文件
-        return StreamingResponse(
-            generate_zip(),
-            media_type='application/zip',
-            headers={
-                "Content-Disposition": f"attachment; filename={zip_filename}",
-                "Content-Length": str(zip_size),
-                "Cache-Control": "no-cache"
-            }
+        # 更新完成状态
+        _update_download_progress(
+            download_task_id,
+            progress_percent=100.0,
+            status="completed",
+            message=f"下载完成：成功打包 {len(file_info_list)} 个文件",
+            download_url=temp_download_url
         )
+        
+        logger.info(f"[Download ZIP] 批量下载完成 | 成功: {len(file_info_list)} 个文件, size={zip_size}, path={temp_zip_path}")
         
     except Exception as e:
-        logger.exception(f"[ZIP] 失败: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建ZIP文件时发生错误: {str(e)}"
+        logger.exception(f"[Download ZIP] 后台任务失败: {e}")
+        _update_download_progress(
+            download_task_id,
+            status="failed",
+            message=f"下载失败: {str(e)}"
         )
+    finally:
+        db.close()
+
+
+@router.get("/download_status", response_model=schemas.DownloadProgress)
+def get_download_status(
+    download_task_id: str,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """查询下载任务的实时进度
+    
+    通过下载接口返回的 download_task_id 查询当前下载进度
+    """
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 检查任务是否存在
+    if download_task_id not in download_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="下载任务不存在或已过期"
+        )
+    
+    progress = download_tasks[download_task_id]
+    return progress
+
+
+@router.get("/download_file_by_task/{download_task_id}")
+def download_file_by_task(
+    download_task_id: str,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """通过下载任务ID下载ZIP文件，下载完成后自动删除临时文件"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 检查任务是否存在
+    if download_task_id not in download_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="下载任务不存在或已过期"
+        )
+    
+    progress = download_tasks[download_task_id]
+    
+    # 检查任务是否已完成
+    if progress.status != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"下载任务尚未完成，当前状态: {progress.status}"
+        )
+    
+    # 检查是否有下载链接
+    if not progress.download_url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="下载文件不存在"
+        )
+    
+    # 获取文件路径
+    file_path = None
+    if download_task_id in download_file_paths:
+        file_path = download_file_paths[download_task_id]
+    else:
+        # 从download_url解析文件路径
+        if progress.download_url:
+            if progress.download_url.startswith("/downloads/"):
+                file_path = progress.download_url.replace("/downloads/", UPLOAD_DIR + "/")
+            elif progress.download_url.startswith("/uploads/"):
+                file_path = progress.download_url.replace("/uploads/", UPLOAD_DIR + "/")
+    
+    if not file_path or not os.path.exists(file_path):
+        # 清理无效的任务记录
+        download_tasks.pop(download_task_id, None)
+        download_file_paths.pop(download_task_id, None)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="下载文件不存在或已过期"
+        )
+    
+    # 获取文件大小
+    file_size = os.path.getsize(file_path)
+    
+    # 从路径获取文件名
+    zip_filename = os.path.basename(file_path)
+    
+    # 创建生成器函数，下载完成后删除文件（仅本地文件）
+    def generate_and_cleanup():
+        try:
+            with open(file_path, 'rb') as f:
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            # 下载完成后删除文件（仅本地文件）
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.info(f"[Download ZIP] 临时文件已删除 | path={file_path}")
+            except Exception as e:
+                logger.warning(f"[Download ZIP] 删除临时文件失败 | path={file_path}, error={e}")
+            
+            # 清理任务记录
+            download_tasks.pop(download_task_id, None)
+            download_file_paths.pop(download_task_id, None)
+    
+    logger.info(f"[Download ZIP] 开始下载（本地文件） | task_id={download_task_id} file={zip_filename} size={file_size}")
+    
+    return StreamingResponse(
+        generate_and_cleanup(),
+        media_type='application/zip',
+        headers={
+            "Content-Disposition": f"attachment; filename={zip_filename}",
+            "Content-Length": str(file_size),
+            "Cache-Control": "no-cache"
+        }
+    )
 
 
 @router.get("/test_download")

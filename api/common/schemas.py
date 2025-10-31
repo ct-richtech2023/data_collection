@@ -274,6 +274,28 @@ class UploadResponse(StrictModel):
     message: str = Field(..., description="响应消息")
 
 
+class DownloadProgress(StrictModel):
+    """下载进度信息"""
+    download_task_id: str = Field(..., description="下载任务ID")
+    total_files: int = Field(..., description="总文件数")
+    processed_files: int = Field(..., description="已处理文件数")
+    current_file: Optional[str] = Field(default=None, description="当前处理的文件名")
+    progress_percent: float = Field(..., description="进度百分比 (0-100)")
+    status: str = Field(..., description="状态: processing|completed|failed")
+    message: Optional[str] = Field(default=None, description="状态消息")
+    s3_download_percent: float = Field(default=0.0, description="当前文件S3下载进度 (0-100)")
+    zip_pack_percent: float = Field(default=0.0, description="ZIP打包进度 (0-100)，仅多文件下载时有效")
+    start_time: Optional[datetime] = Field(default=None, description="开始时间")
+    update_time: Optional[datetime] = Field(default=None, description="更新时间")
+    download_url: Optional[str] = Field(default=None, description="下载URL（完成后填充）")
+
+
+class DownloadResponse(StrictModel):
+    """下载响应 - 包含任务ID"""
+    download_task_id: str = Field(..., description="下载任务ID，用于查询实时状态")
+    message: str = Field(..., description="响应消息")
+
+
 class DataFileUpload(StrictModel):
     task_id: int = Field(..., description="任务ID")
     device_id: int = Field(..., description="设备ID")
