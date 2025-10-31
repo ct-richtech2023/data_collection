@@ -7,6 +7,7 @@ import os
 import uuid
 import zipfile
 import tempfile
+import shutil
 from datetime import datetime
 from mcap.reader import make_reader
 import io
@@ -248,6 +249,230 @@ async def upload_mcap_file(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"上传文件时发生错误: {str(e)}"
+        )
+
+
+@router.post("/upload_zip", response_model=List[schemas.DataFileOut])
+async def upload_zip_file(
+    task_id: int = Form(..., description="任务ID"),
+    device_id: int = Form(..., description="设备ID"),
+    label_ids: str = Form(default="", description="标签ID列表，用逗号分隔，如：1,2,3"),
+    file: UploadFile = File(..., description="ZIP文件，包含一个或多个MCAP文件"),
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """上传ZIP文件 - 解析ZIP中的MCAP文件（单个或多个） - 需要设备权限和上传操作权限"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 权限检查：检查设备权限
+    if not PermissionUtils.check_device_permission(db, current_user.id, device_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有该设备的访问权限"
+        )
+    
+    # 权限检查：检查上传操作权限
+    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "upload"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="您没有文件上传权限"
+        )
+    
+    # 验证文件类型
+    if not file.filename.endswith('.zip'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="只支持上传.zip文件"
+        )
+    
+    # 验证任务是否存在
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="任务不存在"
+        )
+    
+    # 验证设备是否存在
+    device = db.query(models.Device).filter(models.Device.id == device_id).first()
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="设备不存在"
+        )
+    
+    # 解析标签ID列表
+    label_id_list = []
+    if label_ids.strip():
+        try:
+            label_id_list = [int(x.strip()) for x in label_ids.split(',') if x.strip()]
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="标签ID格式错误，请使用逗号分隔的整数，如：1,2,3"
+            )
+    
+    # 验证标签是否存在
+    if label_id_list:
+        existing_labels = db.query(models.Label).filter(models.Label.id.in_(label_id_list)).all()
+        existing_label_ids = [label.id for label in existing_labels]
+        missing_label_ids = set(label_id_list) - set(existing_label_ids)
+        if missing_label_ids:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"以下标签不存在: {list(missing_label_ids)}"
+            )
+    
+    try:
+        # 读取ZIP文件内容
+        zip_content = await file.read()
+        logger.info(f"[Upload ZIP] 收到上传请求 | task_id={task_id} device_id={device_id} user_id={current_user.id} filename={file.filename} size={len(zip_content)}")
+        
+        # 创建临时ZIP文件
+        temp_zip_path = None
+        temp_extract_dir = None
+        created_files = []
+        
+        try:
+            # 保存ZIP到临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_zip:
+                temp_zip_path = tmp_zip.name
+                tmp_zip.write(zip_content)
+            
+            # 创建临时解压目录
+            temp_extract_dir = tempfile.mkdtemp()
+            
+            # 解压ZIP文件
+            with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_extract_dir)
+                file_list = zip_ref.namelist()
+            
+            # 查找所有.mcap文件
+            mcap_files = []
+            for file_name in file_list:
+                if file_name.endswith('.mcap'):
+                    # 获取完整路径
+                    full_path = os.path.join(temp_extract_dir, file_name)
+                    if os.path.isfile(full_path):
+                        mcap_files.append((file_name, full_path))
+            
+            if not mcap_files:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="ZIP文件中未找到.mcap文件"
+                )
+            
+            logger.info(f"[Upload ZIP] 找到 {len(mcap_files)} 个MCAP文件")
+            
+            # 获取S3客户端
+            s3 = get_s3_client()
+            
+            # 处理每个MCAP文件
+            for mcap_filename, mcap_path in mcap_files:
+                try:
+                    # 读取MCAP文件内容
+                    with open(mcap_path, 'rb') as f:
+                        mcap_content = f.read()
+                    
+                    # 解析MCAP文件时长
+                    duration_ms = 60 * 1000  # 默认值
+                    try:
+                        mcap_reader = McapReader(mcap_path)
+                        file_info = mcap_reader.file_info
+                        duration_ms = int(file_info.duration_sec * 1000)
+                        mcap_reader.close()
+                    except Exception as e:
+                        logger.warning(f"[Upload ZIP] 解析MCAP文件信息失败: {mcap_filename}, 错误: {e}")
+                        duration_ms = 60 * 1000
+                    
+                    # 生成唯一对象键（使用原始文件名但添加UUID前缀避免冲突）
+                    base_name = os.path.basename(mcap_filename)
+                    unique_key = f"datafiles/{uuid.uuid4()}_{base_name}"
+                    
+                    # 上传到S3
+                    s3.put_object(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=unique_key,
+                        Body=mcap_content,
+                        ContentType='application/octet-stream'
+                    )
+                    logger.info(f"[S3] 上传成功 | key={unique_key} bucket={S3_BUCKET_NAME} duration_ms={duration_ms}")
+                    download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+                    
+                    # 创建数据文件记录
+                    db_datafile = models.DataFile(
+                        task_id=task_id,
+                        file_name=base_name,  # 使用原始文件名
+                        download_url=download_url,
+                        duration_ms=duration_ms,
+                        user_id=current_user.id,
+                        device_id=device_id
+                    )
+                    db.add(db_datafile)
+                    db.flush()  # 获取ID但不提交
+                    
+                    # 创建标签关联
+                    if label_id_list:
+                        for label_id in label_id_list:
+                            db_datafile_label = models.DataFileLabel(
+                                data_file_id=db_datafile.id,
+                                label_id=label_id
+                            )
+                            db.add(db_datafile_label)
+                    
+                    # 创建文件上传操作日志
+                    from common.operation_log_util import OperationLogUtil
+                    OperationLogUtil.log_file_upload(
+                        db, current_user.username, base_name, db_datafile.id, task_id, device_id
+                    )
+                    
+                    created_files.append(db_datafile)
+                    logger.info(f"[Upload ZIP] MCAP文件处理成功 | data_file_id={db_datafile.id} filename={base_name}")
+                    
+                except Exception as e:
+                    logger.exception(f"[Upload ZIP] 处理MCAP文件失败: {mcap_filename}, 错误: {e}")
+                    # 继续处理下一个文件，不中断整个流程
+                    continue
+            
+            # 提交所有更改
+            db.commit()
+            
+            # 刷新所有对象以获取完整数据
+            for db_datafile in created_files:
+                db.refresh(db_datafile)
+            
+            if not created_files:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="所有MCAP文件处理失败"
+                )
+            
+            logger.info(f"[Upload ZIP] 批量上传完成 | 成功: {len(created_files)}/{len(mcap_files)}")
+            return created_files
+            
+        finally:
+            # 清理临时文件
+            if temp_zip_path and os.path.exists(temp_zip_path):
+                try:
+                    os.remove(temp_zip_path)
+                except Exception:
+                    pass
+            
+            if temp_extract_dir and os.path.exists(temp_extract_dir):
+                try:
+                    shutil.rmtree(temp_extract_dir)
+                except Exception:
+                    pass
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[Upload ZIP] 失败: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"上传ZIP文件时发生错误: {str(e)}"
         )
 
 
