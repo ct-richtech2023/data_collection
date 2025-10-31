@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -28,6 +28,10 @@ router = APIRouter()
 UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
+
+# 上传任务状态存储（内存字典，key: upload_task_id, value: UploadProgress）
+# 格式: {upload_task_id: UploadProgress}
+upload_tasks: dict = {}
 
 # S3 配置（支持 /etc/data_collection/s3.yaml 与环境变量，环境变量优先）
 S3_CONFIG_FILE = "/etc/data_collection/s3.yaml"
@@ -104,8 +108,9 @@ def s3_health(
         )
 
 
-@router.post("/upload_mcap", response_model=List[schemas.DataFileOut])
+@router.post("/upload_mcap", response_model=schemas.UploadResponse)
 async def upload_mcap(
+    background_tasks: BackgroundTasks,
     task_id: int = Form(..., description="任务ID"),
     device_id: int = Form(..., description="设备ID"),
     label_ids: str = Form(default="", description="标签ID列表，用逗号分隔，如：1,2,3"),
@@ -113,7 +118,10 @@ async def upload_mcap(
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """上传文件 - 支持单个MCAP文件或ZIP文件（包含一个或多个MCAP文件） - 需要设备权限和上传操作权限"""
+    """上传文件 - 支持单个MCAP文件或ZIP文件（包含一个或多个MCAP文件） - 需要设备权限和上传操作权限
+    
+    立即返回上传任务ID，文件处理在后台异步执行，可通过 /upload_status 接口查询实时进度
+    """
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
@@ -176,17 +184,717 @@ async def upload_mcap(
                 detail=f"以下标签不存在: {list(missing_label_ids)}"
             )
     
-    # 根据文件扩展名判断处理方式
-    if file.filename.endswith('.mcap'):
-        # 处理单个MCAP文件
-        return await _process_single_mcap(file, task_id, device_id, label_id_list, current_user, db)
-    elif file.filename.endswith('.zip'):
-        # 处理ZIP文件（包含一个或多个MCAP文件）
-        return await _process_zip_file(file, task_id, device_id, label_id_list, current_user, db)
+    # 读取文件内容（在请求期间完成，确保文件不会丢失）
+    file_content = await file.read()
+    filename = file.filename
+    
+    # 生成上传任务ID
+    upload_task_id = str(uuid.uuid4())
+    
+    # 初始化进度信息（根据文件类型判断总文件数）
+    total_files = 1 if filename.endswith('.mcap') else 0
+    progress = schemas.UploadProgress(
+        upload_task_id=upload_task_id,
+        total_files=total_files,
+        processed_files=0,
+        current_file=filename,
+        progress_percent=0.0,
+        status="processing",
+        message="上传任务已创建，等待处理...",
+        start_time=datetime.now(),
+        update_time=datetime.now()
+    )
+    
+    # 存储到内存字典
+    upload_tasks[upload_task_id] = progress
+    
+    # 保存用户信息用于后台任务（不能直接传递用户对象，需要传递ID和用户名）
+    user_id = current_user.id
+    username = current_user.username
+    
+    # 根据文件扩展名添加后台任务
+    if filename.endswith('.mcap'):
+        background_tasks.add_task(
+            _process_single_mcap_with_progress_background,
+            file_content=file_content,
+            filename=filename,
+            task_id=task_id,
+            device_id=device_id,
+            label_id_list=label_id_list,
+            user_id=user_id,
+            username=username,
+            upload_task_id=upload_task_id
+        )
+    elif filename.endswith('.zip'):
+        background_tasks.add_task(
+            _process_zip_file_with_progress_background,
+            file_content=file_content,
+            filename=filename,
+            task_id=task_id,
+            device_id=device_id,
+            label_id_list=label_id_list,
+            user_id=user_id,
+            username=username,
+            upload_task_id=upload_task_id
+        )
     else:
+        # 清理任务状态
+        upload_tasks.pop(upload_task_id, None)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="不支持的文件类型"
+        )
+    
+    # 立即返回任务ID
+    return schemas.UploadResponse(
+        upload_task_id=upload_task_id,
+        message="上传任务已启动，请使用 upload_task_id 查询实时进度"
+    )
+
+
+def _update_progress(upload_task_id: str, **kwargs):
+    """更新上传进度"""
+    if upload_task_id in upload_tasks:
+        progress = upload_tasks[upload_task_id]
+        for key, value in kwargs.items():
+            if hasattr(progress, key):
+                setattr(progress, key, value)
+        progress.update_time = datetime.now()
+        upload_tasks[upload_task_id] = progress
+
+
+def _process_single_mcap_with_progress_background(
+    file_content: bytes,
+    filename: str,
+    task_id: int,
+    device_id: int,
+    label_id_list: List[int],
+    user_id: int,
+    username: str,
+    upload_task_id: str
+):
+    """后台任务：处理单个MCAP文件上传（带进度更新）"""
+    from common.database import SessionLocal
+    
+    db = SessionLocal()
+    try:
+        # 更新进度：开始处理文件
+        _update_progress(upload_task_id, progress_percent=10.0, message="正在解析文件...")
+        
+        logger.info(f"[Upload MCAP] 后台任务开始 | task_id={task_id} device_id={device_id} user_id={user_id} filename={filename} size={len(file_content)}")
+        
+        # 生成唯一对象键
+        file_extension = os.path.splitext(filename)[1]
+        unique_key = f"datafiles/{uuid.uuid4()}{file_extension}"
+        
+        # 将内容写入临时文件以便解析 MCAP 时长
+        temp_path = None
+        duration_ms = 60 * 1000  # 默认值
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mcap')
+            temp_path = tmp.name
+            tmp.write(file_content)
+            tmp.close()
+            mcap_reader = McapReader(temp_path)
+            file_info = mcap_reader.file_info
+            duration_ms = int(file_info.duration_sec * 1000)
+            mcap_reader.close()
+        except Exception as e:
+            logger.warning(f"[Upload MCAP] 解析MCAP文件信息失败: {e}")
+            duration_ms = 60 * 1000
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+        
+        # 更新进度：解析完成，开始上传到S3
+        _update_progress(upload_task_id, progress_percent=40.0, message="正在上传到S3...")
+        
+        # 创建进度回调函数
+        total_size = len(file_content)
+        upload_progress_start = 40.0
+        upload_progress_end = 70.0
+        upload_progress_range = upload_progress_end - upload_progress_start
+        
+        # 创建进度回调函数（优化更新频率，避免过于频繁的更新）
+        last_update_percent = 0
+        update_threshold = 1.0  # 每1%更新一次
+        
+        def upload_progress_callback(bytes_transferred):
+            """S3上传进度回调"""
+            nonlocal last_update_percent
+            if total_size > 0:
+                upload_percent = (bytes_transferred / total_size) * 100.0
+                # 只在进度变化超过阈值时更新，避免过于频繁
+                if abs(upload_percent - last_update_percent) >= update_threshold or bytes_transferred >= total_size:
+                    progress_percent_in_range = (bytes_transferred / total_size) * upload_progress_range
+                    current_progress = upload_progress_start + progress_percent_in_range
+                    # 格式化文件大小显示
+                    transferred_mb = bytes_transferred / (1024 * 1024)
+                    total_mb = total_size / (1024 * 1024)
+                    _update_progress(
+                        upload_task_id,
+                        progress_percent=current_progress,
+                        message=f"正在上传到S3... {transferred_mb:.2f}/{total_mb:.2f} MB ({upload_percent:.1f}%)"
+                    )
+                    last_update_percent = upload_percent
+        
+        # 使用 upload_fileobj 上传到 S3（支持进度回调）
+        s3 = get_s3_client()
+        
+        # 配置传输参数，启用进度回调（使用 TransferConfig）
+        from boto3.s3.transfer import TransferConfig
+        transfer_config = TransferConfig(
+            multipart_threshold=1024 * 1024 * 5,  # 5MB 以上使用分块上传
+            multipart_chunksize=1024 * 1024 * 10  # 10MB 分块大小
+        )
+        
+        # 使用 upload_fileobj 配合回调跟踪进度
+        try:
+            # 创建包装类来跟踪上传进度
+            class ProgressFile(io.BytesIO):
+                def __init__(self, data, callback):
+                    super().__init__(data)
+                    self._callback = callback
+                    self._bytes_transferred = 0
+                    self._len = len(data)
+                    self._last_callback_size = 0
+                    self._callback_threshold = max(1024 * 1024, len(data) // 100)  # 至少1MB或1%的阈值
+                
+                def read(self, size=-1):
+                    chunk = super().read(size)
+                    if chunk:
+                        self._bytes_transferred += len(chunk)
+                        # 只在达到阈值或完成时调用回调，减少更新频率
+                        if (self._bytes_transferred - self._last_callback_size) >= self._callback_threshold or \
+                           self._bytes_transferred >= self._len:
+                            if self._callback:
+                                self._callback(self._bytes_transferred)
+                            self._last_callback_size = self._bytes_transferred
+                    return chunk
+                
+                def __len__(self):
+                    return self._len
+            
+            progress_file = ProgressFile(file_content, upload_progress_callback)
+            
+            # 使用 upload_fileobj 上传（支持进度跟踪）
+            s3.upload_fileobj(
+                progress_file,
+                S3_BUCKET_NAME,
+                unique_key,
+                ExtraArgs={'ContentType': 'application/octet-stream'},
+                Config=transfer_config
+            )
+        except Exception as e:
+            logger.warning(f"[S3] upload_fileobj 失败，尝试使用 put_object: {e}")
+            # 如果 upload_fileobj 失败，回退到 put_object
+            s3.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=unique_key,
+                Body=file_content,
+                ContentType='application/octet-stream'
+            )
+            # 手动更新进度为完成
+            _update_progress(upload_task_id, progress_percent=upload_progress_end, message="正在上传到S3...")
+        
+        logger.info(f"[S3] 上传成功 | key={unique_key} bucket={S3_BUCKET_NAME} duration_ms={duration_ms} size={total_size}")
+        download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+        
+        # 更新进度：S3上传完成
+        _update_progress(upload_task_id, progress_percent=70.0, message="S3上传完成，正在保存数据库记录...")
+        
+        # 创建数据文件记录
+        db_datafile = models.DataFile(
+            task_id=task_id,
+            file_name=filename,
+            download_url=download_url,
+            duration_ms=duration_ms,
+            user_id=user_id,
+            device_id=device_id
+        )
+        db.add(db_datafile)
+        db.flush()  # 获取ID但不提交
+        
+        # 创建标签关联
+        if label_id_list:
+            for label_id in label_id_list:
+                db_datafile_label = models.DataFileLabel(
+                    data_file_id=db_datafile.id,
+                    label_id=label_id
+                )
+                db.add(db_datafile_label)
+        
+        # 更新进度：数据库记录创建完成
+        _update_progress(upload_task_id, progress_percent=90.0, message="正在创建操作日志...")
+        
+        # 创建文件上传操作日志
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.log_file_upload(
+            db, username, filename, db_datafile.id, task_id, device_id
+        )
+        
+        # 提交所有更改
+        db.commit()
+        db.refresh(db_datafile)
+        
+        # 更新进度：完成
+        _update_progress(
+            upload_task_id,
+            progress_percent=100.0,
+            processed_files=1,
+            status="completed",
+            message="上传完成",
+            completed_files=[schemas.DataFileOut.model_validate(db_datafile)]
+        )
+        
+        logger.info(f"[Upload MCAP] 数据库记录创建成功 | data_file_id={db_datafile.id}")
+        
+    except Exception as e:
+        logger.exception(f"[Upload MCAP] 后台任务失败: {e}")
+        db.rollback()
+        _update_progress(
+            upload_task_id,
+            status="failed",
+            progress_percent=0.0,
+            message=f"上传失败: {str(e)}"
+        )
+    finally:
+        db.close()
+
+
+def _process_zip_file_with_progress_background(
+    file_content: bytes,
+    filename: str,
+    task_id: int,
+    device_id: int,
+    label_id_list: List[int],
+    user_id: int,
+    username: str,
+    upload_task_id: str
+):
+    """后台任务：处理ZIP文件上传（包含一个或多个MCAP文件，带进度更新）"""
+    from common.database import SessionLocal
+    
+    db = SessionLocal()
+    try:
+        # 更新进度：开始读取ZIP文件
+        _update_progress(upload_task_id, progress_percent=5.0, message="正在读取ZIP文件...")
+        
+        logger.info(f"[Upload ZIP] 后台任务开始 | task_id={task_id} device_id={device_id} user_id={user_id} filename={filename} size={len(file_content)}")
+        
+        # 更新进度：ZIP文件读取完成
+        _update_progress(upload_task_id, progress_percent=10.0, message="正在解压ZIP文件...")
+        
+        # 创建临时ZIP文件
+        temp_zip_path = None
+        temp_extract_dir = None
+        created_files = []
+        
+        try:
+            # 保存ZIP到临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_zip:
+                temp_zip_path = tmp_zip.name
+                tmp_zip.write(file_content)
+            
+            # 创建临时解压目录
+            temp_extract_dir = tempfile.mkdtemp()
+            
+            # 解压ZIP文件
+            with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_extract_dir)
+                file_list = zip_ref.namelist()
+            
+            # 查找所有.mcap文件
+            mcap_files = []
+            for file_name in file_list:
+                if file_name.endswith('.mcap'):
+                    # 获取完整路径
+                    full_path = os.path.join(temp_extract_dir, file_name)
+                    if os.path.isfile(full_path):
+                        mcap_files.append((file_name, full_path))
+            
+            if not mcap_files:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="ZIP文件中未找到.mcap文件"
+                )
+            
+            logger.info(f"[Upload ZIP] 找到 {len(mcap_files)} 个MCAP文件")
+            
+            # 更新进度：解压完成，开始处理文件
+            _update_progress(
+                upload_task_id,
+                total_files=len(mcap_files),
+                progress_percent=15.0,
+                message=f"找到 {len(mcap_files)} 个MCAP文件，开始处理..."
+            )
+            
+            # 获取S3客户端
+            s3 = get_s3_client()
+            
+            # 处理每个MCAP文件
+            for idx, (mcap_filename, mcap_path) in enumerate(mcap_files, 1):
+                # 更新当前处理的文件
+                base_name = os.path.basename(mcap_filename)
+                _update_progress(
+                    upload_task_id,
+                    current_file=base_name,
+                    message=f"正在处理第 {idx}/{len(mcap_files)} 个文件: {base_name}"
+                )
+                try:
+                    # 读取MCAP文件内容
+                    with open(mcap_path, 'rb') as f:
+                        mcap_content = f.read()
+                    
+                    # 解析MCAP文件时长
+                    duration_ms = 60 * 1000  # 默认值
+                    try:
+                        mcap_reader = McapReader(mcap_path)
+                        file_info = mcap_reader.file_info
+                        duration_ms = int(file_info.duration_sec * 1000)
+                        mcap_reader.close()
+                    except Exception as e:
+                        logger.warning(f"[Upload ZIP] 解析MCAP文件信息失败: {mcap_filename}, 错误: {e}")
+                        duration_ms = 60 * 1000
+                    
+                    # 生成唯一对象键（使用原始文件名但添加UUID前缀避免冲突）
+                    unique_key = f"datafiles/{uuid.uuid4()}_{base_name}"
+                    
+                    # 创建进度回调函数
+                    total_size = len(mcap_content)
+                    # 计算当前文件在整个ZIP处理中的进度范围
+                    # 解压完成15% + 处理文件85%，每个文件平分这85%
+                    file_index_progress = 15.0 + (85.0 * (idx - 1) / len(mcap_files))
+                    file_next_progress = 15.0 + (85.0 * idx / len(mcap_files))
+                    file_progress_range = file_next_progress - file_index_progress
+                    # S3上传占用当前文件处理的60%（40%用于解析，60%用于上传）
+                    s3_upload_start = file_index_progress + file_progress_range * 0.4
+                    s3_upload_end = file_index_progress + file_progress_range * 1.0
+                    s3_upload_range = s3_upload_end - s3_upload_start
+                    
+                    # 创建进度回调函数（优化更新频率）
+                    last_update_percent = 0
+                    update_threshold = 1.0  # 每1%更新一次
+                    
+                    def upload_progress_callback(bytes_transferred):
+                        """S3上传进度回调"""
+                        nonlocal last_update_percent
+                        if total_size > 0:
+                            upload_percent = (bytes_transferred / total_size) * 100.0
+                            # 只在进度变化超过阈值时更新
+                            if abs(upload_percent - last_update_percent) >= update_threshold or bytes_transferred >= total_size:
+                                progress_percent_in_range = (bytes_transferred / total_size) * s3_upload_range
+                                current_progress = s3_upload_start + progress_percent_in_range
+                                # 格式化文件大小显示
+                                transferred_mb = bytes_transferred / (1024 * 1024)
+                                total_mb = total_size / (1024 * 1024)
+                                _update_progress(
+                                    upload_task_id,
+                                    progress_percent=current_progress,
+                                    message=f"正在上传第 {idx}/{len(mcap_files)} 个文件到S3... {transferred_mb:.2f}/{total_mb:.2f} MB ({upload_percent:.1f}%)"
+                                )
+                                last_update_percent = upload_percent
+                    
+                    # 使用 upload_fileobj 上传到 S3（支持进度回调）
+                    s3 = get_s3_client()
+                    
+                    # 创建包装类来跟踪上传进度
+                    class ProgressFile(io.BytesIO):
+                        def __init__(self, data, callback):
+                            super().__init__(data)
+                            self._callback = callback
+                            self._bytes_transferred = 0
+                            self._len = len(data)
+                            self._last_callback_size = 0
+                            self._callback_threshold = max(1024 * 1024, len(data) // 100)  # 至少1MB或1%的阈值
+                        
+                        def read(self, size=-1):
+                            chunk = super().read(size)
+                            if chunk:
+                                self._bytes_transferred += len(chunk)
+                                # 只在达到阈值或完成时调用回调，减少更新频率
+                                if (self._bytes_transferred - self._last_callback_size) >= self._callback_threshold or \
+                                   self._bytes_transferred >= self._len:
+                                    if self._callback:
+                                        self._callback(self._bytes_transferred)
+                                    self._last_callback_size = self._bytes_transferred
+                            return chunk
+                        
+                        def __len__(self):
+                            return self._len
+                    
+                    progress_file = ProgressFile(mcap_content, upload_progress_callback)
+                    
+                    # 配置传输参数（使用 TransferConfig）
+                    from boto3.s3.transfer import TransferConfig
+                    transfer_config = TransferConfig(
+                        multipart_threshold=1024 * 1024 * 5,  # 5MB 以上使用分块上传
+                        multipart_chunksize=1024 * 1024 * 10  # 10MB 分块大小
+                    )
+                    
+                    # 使用 upload_fileobj 上传（支持进度跟踪）
+                    try:
+                        s3.upload_fileobj(
+                            progress_file,
+                            S3_BUCKET_NAME,
+                            unique_key,
+                            ExtraArgs={'ContentType': 'application/octet-stream'},
+                            Config=transfer_config
+                        )
+                    except Exception as e:
+                        logger.warning(f"[S3] upload_fileobj 失败，尝试使用 put_object: {e}")
+                        # 如果 upload_fileobj 失败，回退到 put_object
+                        s3.put_object(
+                            Bucket=S3_BUCKET_NAME,
+                            Key=unique_key,
+                            Body=mcap_content,
+                            ContentType='application/octet-stream'
+                        )
+                        # 手动更新进度
+                        _update_progress(upload_task_id, progress_percent=s3_upload_end, message=f"正在上传第 {idx}/{len(mcap_files)} 个文件到S3...")
+                    
+                    logger.info(f"[S3] 上传成功 | key={unique_key} bucket={S3_BUCKET_NAME} duration_ms={duration_ms} size={total_size}")
+                    download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+                    
+                    # 创建数据文件记录
+                    db_datafile = models.DataFile(
+                        task_id=task_id,
+                        file_name=base_name,  # 使用原始文件名
+                        download_url=download_url,
+                        duration_ms=duration_ms,
+                        user_id=user_id,
+                        device_id=device_id
+                    )
+                    db.add(db_datafile)
+                    db.flush()  # 获取ID但不提交
+                    
+                    # 创建标签关联
+                    if label_id_list:
+                        for label_id in label_id_list:
+                            db_datafile_label = models.DataFileLabel(
+                                data_file_id=db_datafile.id,
+                                label_id=label_id
+                            )
+                            db.add(db_datafile_label)
+                    
+                    # 创建文件上传操作日志
+                    from common.operation_log_util import OperationLogUtil
+                    OperationLogUtil.log_file_upload(
+                        db, username, base_name, db_datafile.id, task_id, device_id
+                    )
+                    
+                    created_files.append(db_datafile)
+                    logger.info(f"[Upload ZIP] MCAP文件处理成功 | data_file_id={db_datafile.id} filename={base_name}")
+                    
+                    # 更新进度：文件处理成功
+                    completed_file_data = schemas.DataFileOut.model_validate(db_datafile)
+                    current_progress = upload_tasks.get(upload_task_id)
+                    if current_progress:
+                        completed_list = list(current_progress.completed_files) if current_progress.completed_files else []
+                        completed_list.append(completed_file_data)
+                        # 计算总体进度：解压15% + 处理85% * (已处理文件数/总文件数)
+                        progress_percent = 15.0 + (85.0 * len(completed_list) / len(mcap_files))
+                        _update_progress(
+                            upload_task_id,
+                            processed_files=len(completed_list),
+                            progress_percent=progress_percent,
+                            completed_files=completed_list
+                        )
+                    
+                except Exception as e:
+                    logger.exception(f"[Upload ZIP] 处理MCAP文件失败: {mcap_filename}, 错误: {e}")
+                    # 更新失败文件列表
+                    failed_name = os.path.basename(mcap_filename)
+                    current_progress = upload_tasks.get(upload_task_id)
+                    if current_progress:
+                        failed_list = list(current_progress.failed_files) if current_progress.failed_files else []
+                        failed_list.append(failed_name)
+                        _update_progress(upload_task_id, failed_files=failed_list)
+                    # 继续处理下一个文件，不中断整个流程
+                    continue
+            
+            # 提交所有更改
+            db.commit()
+            
+            # 刷新所有对象以获取完整数据
+            for db_datafile in created_files:
+                db.refresh(db_datafile)
+            
+            # 更新最终进度
+            _update_progress(upload_task_id, progress_percent=100.0)
+            
+            if not created_files:
+                _update_progress(
+                    upload_task_id,
+                    status="failed",
+                    message="所有MCAP文件处理失败"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="所有MCAP文件处理失败"
+                )
+            else:
+                current_progress = upload_tasks.get(upload_task_id)
+                if current_progress and current_progress.failed_files:
+                    message = f"上传完成: 成功 {len(created_files)}/{len(mcap_files)} 个文件，失败 {len(current_progress.failed_files)} 个"
+                else:
+                    message = f"上传完成: 成功处理所有 {len(created_files)} 个文件"
+                _update_progress(
+                    upload_task_id,
+                    status="completed",
+                    message=message
+                )
+            
+            logger.info(f"[Upload ZIP] 批量上传完成 | 成功: {len(created_files)}/{len(mcap_files)}")
+            
+        finally:
+            # 清理临时文件
+            if temp_zip_path and os.path.exists(temp_zip_path):
+                try:
+                    os.remove(temp_zip_path)
+                except Exception:
+                    pass
+            
+            if temp_extract_dir and os.path.exists(temp_extract_dir):
+                try:
+                    shutil.rmtree(temp_extract_dir)
+                except Exception:
+                    pass
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[Upload ZIP] 后台任务失败: {e}")
+        db.rollback()
+        _update_progress(
+            upload_task_id,
+            status="failed",
+            message=f"上传失败: {str(e)}"
+        )
+    finally:
+        db.close()
+
+
+async def _process_single_mcap_with_progress(
+    file: UploadFile,
+    task_id: int,
+    device_id: int,
+    label_id_list: List[int],
+    current_user: models.User,
+    db: Session,
+    upload_task_id: str
+) -> None:
+    """处理单个MCAP文件上传（带进度更新）"""
+    try:
+        # 更新进度：开始读取文件
+        _update_progress(upload_task_id, progress_percent=10.0, message="正在读取文件...")
+        
+        # 读取文件内容
+        content = await file.read()
+        logger.info(f"[Upload MCAP] 收到上传请求 | task_id={task_id} device_id={device_id} user_id={current_user.id} filename={file.filename} size={len(content)}")
+        
+        # 更新进度：文件读取完成
+        _update_progress(upload_task_id, progress_percent=20.0, message="文件读取完成，正在解析...")
+        
+        # 生成唯一对象键
+        file_extension = os.path.splitext(file.filename)[1]
+        unique_key = f"datafiles/{uuid.uuid4()}{file_extension}"
+        
+        # 将内容写入临时文件以便解析 MCAP 时长
+        temp_path = None
+        duration_ms = 60 * 1000  # 默认值
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mcap')
+            temp_path = tmp.name
+            tmp.write(content)
+            tmp.close()
+            mcap_reader = McapReader(temp_path)
+            file_info = mcap_reader.file_info
+            duration_ms = int(file_info.duration_sec * 1000)
+            mcap_reader.close()
+        except Exception as e:
+            logger.warning(f"[Upload MCAP] 解析MCAP文件信息失败: {e}")
+            duration_ms = 60 * 1000
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+        
+        # 更新进度：解析完成，开始上传到S3
+        _update_progress(upload_task_id, progress_percent=40.0, message="正在上传到S3...")
+        
+        # 上传到 S3
+        s3 = get_s3_client()
+        s3.put_object(Bucket=S3_BUCKET_NAME, Key=unique_key, Body=content, ContentType='application/octet-stream')
+        logger.info(f"[S3] 上传成功 | key={unique_key} bucket={S3_BUCKET_NAME} duration_ms={duration_ms}")
+        download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+        
+        # 更新进度：S3上传完成
+        _update_progress(upload_task_id, progress_percent=70.0, message="S3上传完成，正在保存数据库记录...")
+        
+        # 创建数据文件记录
+        db_datafile = models.DataFile(
+            task_id=task_id,
+            file_name=file.filename,
+            download_url=download_url,
+            duration_ms=duration_ms,
+            user_id=current_user.id,
+            device_id=device_id
+        )
+        db.add(db_datafile)
+        db.flush()  # 获取ID但不提交
+        
+        # 创建标签关联
+        if label_id_list:
+            for label_id in label_id_list:
+                db_datafile_label = models.DataFileLabel(
+                    data_file_id=db_datafile.id,
+                    label_id=label_id
+                )
+                db.add(db_datafile_label)
+        
+        # 更新进度：数据库记录创建完成
+        _update_progress(upload_task_id, progress_percent=90.0, message="正在创建操作日志...")
+        
+        # 创建文件上传操作日志
+        from common.operation_log_util import OperationLogUtil
+        OperationLogUtil.log_file_upload(
+            db, current_user.username, file.filename, db_datafile.id, task_id, device_id
+        )
+        
+        # 提交所有更改
+        db.commit()
+        db.refresh(db_datafile)
+        
+        # 更新进度：完成
+        _update_progress(
+            upload_task_id,
+            progress_percent=100.0,
+            processed_files=1,
+            status="completed",
+            message="上传完成",
+            completed_files=[schemas.DataFileOut.model_validate(db_datafile)]
+        )
+        
+        logger.info(f"[Upload MCAP] 数据库记录创建成功 | data_file_id={db_datafile.id}")
+        
+    except Exception as e:
+        logger.exception(f"[Upload MCAP] 失败: {e}")
+        db.rollback()
+        _update_progress(
+            upload_task_id,
+            status="failed",
+            progress_percent=0.0,
+            message=f"上传失败: {str(e)}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"上传MCAP文件时发生错误: {str(e)}"
         )
 
 
@@ -198,7 +906,7 @@ async def _process_single_mcap(
     current_user: models.User,
     db: Session
 ) -> List[schemas.DataFileOut]:
-    """处理单个MCAP文件上传"""
+    """处理单个MCAP文件上传（旧版本，保留兼容性）"""
     try:
         # 读取文件内容
         content = await file.read()
@@ -279,19 +987,26 @@ async def _process_single_mcap(
         )
 
 
-async def _process_zip_file(
+async def _process_zip_file_with_progress(
     file: UploadFile,
     task_id: int,
     device_id: int,
     label_id_list: List[int],
     current_user: models.User,
-    db: Session
-) -> List[schemas.DataFileOut]:
-    """处理ZIP文件上传（包含一个或多个MCAP文件）"""
+    db: Session,
+    upload_task_id: str
+) -> None:
+    """处理ZIP文件上传（包含一个或多个MCAP文件，带进度更新）"""
     try:
+        # 更新进度：开始读取ZIP文件
+        _update_progress(upload_task_id, progress_percent=5.0, message="正在读取ZIP文件...")
+        
         # 读取ZIP文件内容
         zip_content = await file.read()
         logger.info(f"[Upload ZIP] 收到上传请求 | task_id={task_id} device_id={device_id} user_id={current_user.id} filename={file.filename} size={len(zip_content)}")
+        
+        # 更新进度：ZIP文件读取完成
+        _update_progress(upload_task_id, progress_percent=10.0, message="正在解压ZIP文件...")
         
         # 创建临时ZIP文件
         temp_zip_path = None
@@ -329,11 +1044,26 @@ async def _process_zip_file(
             
             logger.info(f"[Upload ZIP] 找到 {len(mcap_files)} 个MCAP文件")
             
+            # 更新进度：解压完成，开始处理文件
+            _update_progress(
+                upload_task_id,
+                total_files=len(mcap_files),
+                progress_percent=15.0,
+                message=f"找到 {len(mcap_files)} 个MCAP文件，开始处理..."
+            )
+            
             # 获取S3客户端
             s3 = get_s3_client()
             
             # 处理每个MCAP文件
-            for mcap_filename, mcap_path in mcap_files:
+            for idx, (mcap_filename, mcap_path) in enumerate(mcap_files, 1):
+                # 更新当前处理的文件
+                base_name = os.path.basename(mcap_filename)
+                _update_progress(
+                    upload_task_id,
+                    current_file=base_name,
+                    message=f"正在处理第 {idx}/{len(mcap_files)} 个文件: {base_name}"
+                )
                 try:
                     # 读取MCAP文件内容
                     with open(mcap_path, 'rb') as f:
@@ -394,8 +1124,30 @@ async def _process_zip_file(
                     created_files.append(db_datafile)
                     logger.info(f"[Upload ZIP] MCAP文件处理成功 | data_file_id={db_datafile.id} filename={base_name}")
                     
+                    # 更新进度：文件处理成功
+                    completed_file_data = schemas.DataFileOut.model_validate(db_datafile)
+                    current_progress = upload_tasks.get(upload_task_id)
+                    if current_progress:
+                        completed_list = list(current_progress.completed_files) if current_progress.completed_files else []
+                        completed_list.append(completed_file_data)
+                        # 计算总体进度：解压15% + 处理85% * (已处理文件数/总文件数)
+                        progress_percent = 15.0 + (85.0 * len(completed_list) / len(mcap_files))
+                        _update_progress(
+                            upload_task_id,
+                            processed_files=len(completed_list),
+                            progress_percent=progress_percent,
+                            completed_files=completed_list
+                        )
+                    
                 except Exception as e:
                     logger.exception(f"[Upload ZIP] 处理MCAP文件失败: {mcap_filename}, 错误: {e}")
+                    # 更新失败文件列表
+                    failed_name = os.path.basename(mcap_filename)
+                    current_progress = upload_tasks.get(upload_task_id)
+                    if current_progress:
+                        failed_list = list(current_progress.failed_files) if current_progress.failed_files else []
+                        failed_list.append(failed_name)
+                        _update_progress(upload_task_id, failed_files=failed_list)
                     # 继续处理下一个文件，不中断整个流程
                     continue
             
@@ -406,14 +1158,32 @@ async def _process_zip_file(
             for db_datafile in created_files:
                 db.refresh(db_datafile)
             
+            # 更新最终进度
+            _update_progress(upload_task_id, progress_percent=100.0)
+            
             if not created_files:
+                _update_progress(
+                    upload_task_id,
+                    status="failed",
+                    message="所有MCAP文件处理失败"
+                )
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="所有MCAP文件处理失败"
                 )
+            else:
+                current_progress = upload_tasks.get(upload_task_id)
+                if current_progress and current_progress.failed_files:
+                    message = f"上传完成: 成功 {len(created_files)}/{len(mcap_files)} 个文件，失败 {len(current_progress.failed_files)} 个"
+                else:
+                    message = f"上传完成: 成功处理所有 {len(created_files)} 个文件"
+                _update_progress(
+                    upload_task_id,
+                    status="completed",
+                    message=message
+                )
             
             logger.info(f"[Upload ZIP] 批量上传完成 | 成功: {len(created_files)}/{len(mcap_files)}")
-            return created_files
             
         finally:
             # 清理临时文件
@@ -434,10 +1204,39 @@ async def _process_zip_file(
     except Exception as e:
         logger.exception(f"[Upload ZIP] 失败: {e}")
         db.rollback()
+        _update_progress(
+            upload_task_id,
+            status="failed",
+            message=f"上传失败: {str(e)}"
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"上传ZIP文件时发生错误: {str(e)}"
         )
+
+
+@router.get("/upload_status", response_model=schemas.UploadProgress)
+def get_upload_status(
+    upload_task_id: str,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """查询上传任务的实时进度
+    
+    通过上传接口返回的 upload_task_id 查询当前上传进度
+    """
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    
+    # 检查任务是否存在
+    if upload_task_id not in upload_tasks:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="上传任务不存在或已过期"
+        )
+    
+    progress = upload_tasks[upload_task_id]
+    return progress
 
 
 @router.get("/get_all_datafiles", response_model=List[schemas.DataFileOut])
