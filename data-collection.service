@@ -7,11 +7,11 @@ Requires=network.target docker.service
 Type=simple
 User=ec2-user
 Group=ec2-user
-WorkingDirectory=/home/ec2-user/data_collection
+WorkingDirectory=/home/ec2-user/data_collection/api
 Environment="PATH=/home/ec2-user/miniconda3/envs/data_collection/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="DATABASE_URL=postgresql://postgres:richtech@127.0.0.1:5432/filesvc"
 Environment="PYTHONPATH=/home/ec2-user/data_collection"
-ExecStart=/home/ec2-user/miniconda3/envs/data_collection/bin/uvicorn api.app:app --host 0.0.0.0 --port 9000 --workers 4
+ExecStart=/home/ec2-user/miniconda3/envs/data_collection/bin/uvicorn app:app --host 0.0.0.0 --port 9000 --workers 4
 ExecReload=/bin/kill -s HUP $MAINPID
 KillMode=mixed
 KillSignal=SIGINT
