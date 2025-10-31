@@ -104,16 +104,16 @@ def s3_health(
         )
 
 
-@router.post("/upload_mcap", response_model=schemas.DataFileOut)
-async def upload_mcap_file(
+@router.post("/upload_mcap", response_model=List[schemas.DataFileOut])
+async def upload_mcap(
     task_id: int = Form(..., description="任务ID"),
     device_id: int = Form(..., description="设备ID"),
     label_ids: str = Form(default="", description="标签ID列表，用逗号分隔，如：1,2,3"),
-    file: UploadFile = File(..., description="MCAP文件"),
+    file: UploadFile = File(..., description="MCAP文件或ZIP文件（包含MCAP文件）"),
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
 ):
-    """上传MCAP文件 - 需要设备权限和上传操作权限"""
+    """上传文件 - 支持单个MCAP文件或ZIP文件（包含一个或多个MCAP文件） - 需要设备权限和上传操作权限"""
     # 验证token并获取当前用户
     current_user = get_current_user(token, db)
     
@@ -126,16 +126,16 @@ async def upload_mcap_file(
     
     # 权限检查：检查上传操作权限
     if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "upload"):
-               raise HTTPException(
+        raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="您没有文件上传权限"
         )
     
-    # 验证文件类型
-    if not file.filename.endswith('.mcap'):
+    # 验证文件类型（支持 .mcap 和 .zip）
+    if not (file.filename.endswith('.mcap') or file.filename.endswith('.zip')):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="只支持上传.mcap文件"
+            detail="只支持上传.mcap文件或.zip文件"
         )
     
     # 验证任务是否存在
@@ -176,10 +176,33 @@ async def upload_mcap_file(
                 detail=f"以下标签不存在: {list(missing_label_ids)}"
             )
     
+    # 根据文件扩展名判断处理方式
+    if file.filename.endswith('.mcap'):
+        # 处理单个MCAP文件
+        return await _process_single_mcap(file, task_id, device_id, label_id_list, current_user, db)
+    elif file.filename.endswith('.zip'):
+        # 处理ZIP文件（包含一个或多个MCAP文件）
+        return await _process_zip_file(file, task_id, device_id, label_id_list, current_user, db)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持的文件类型"
+        )
+
+
+async def _process_single_mcap(
+    file: UploadFile,
+    task_id: int,
+    device_id: int,
+    label_id_list: List[int],
+    current_user: models.User,
+    db: Session
+) -> List[schemas.DataFileOut]:
+    """处理单个MCAP文件上传"""
     try:
         # 读取文件内容
         content = await file.read()
-        logger.info(f"[Upload] 收到上传请求 | task_id={task_id} device_id={device_id} user_id={current_user.id} filename={file.filename} size={len(content)}")
+        logger.info(f"[Upload MCAP] 收到上传请求 | task_id={task_id} device_id={device_id} user_id={current_user.id} filename={file.filename} size={len(content)}")
         
         # 生成唯一对象键
         file_extension = os.path.splitext(file.filename)[1]
@@ -187,8 +210,9 @@ async def upload_mcap_file(
         
         # 将内容写入临时文件以便解析 MCAP 时长
         temp_path = None
+        duration_ms = 60 * 1000  # 默认值
         try:
-            tmp = tempfile.NamedTemporaryFile(delete=False)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mcap')
             temp_path = tmp.name
             tmp.write(content)
             tmp.close()
@@ -197,7 +221,7 @@ async def upload_mcap_file(
             duration_ms = int(file_info.duration_sec * 1000)
             mcap_reader.close()
         except Exception as e:
-            print(f"解析MCAP文件信息失败: {e}")
+            logger.warning(f"[Upload MCAP] 解析MCAP文件信息失败: {e}")
             duration_ms = 60 * 1000
         finally:
             if temp_path and os.path.exists(temp_path):
@@ -222,8 +246,7 @@ async def upload_mcap_file(
             device_id=device_id
         )
         db.add(db_datafile)
-        db.commit()
-        db.refresh(db_datafile)
+        db.flush()  # 获取ID但不提交
         
         # 创建标签关联
         if label_id_list:
@@ -233,7 +256,6 @@ async def upload_mcap_file(
                     label_id=label_id
                 )
                 db.add(db_datafile_label)
-            db.commit()
         
         # 创建文件上传操作日志
         from common.operation_log_util import OperationLogUtil
@@ -241,89 +263,31 @@ async def upload_mcap_file(
             db, current_user.username, file.filename, db_datafile.id, task_id, device_id
         )
         
-        logger.info(f"[Upload] 数据库记录创建成功 | data_file_id={db_datafile.id}")
-        return db_datafile
+        # 提交所有更改
+        db.commit()
+        db.refresh(db_datafile)
+        
+        logger.info(f"[Upload MCAP] 数据库记录创建成功 | data_file_id={db_datafile.id}")
+        return [db_datafile]
         
     except Exception as e:
-        logger.exception(f"[Upload] 失败: {e}")
+        logger.exception(f"[Upload MCAP] 失败: {e}")
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"上传文件时发生错误: {str(e)}"
+            detail=f"上传MCAP文件时发生错误: {str(e)}"
         )
 
 
-@router.post("/upload_zip", response_model=List[schemas.DataFileOut])
-async def upload_zip_file(
-    task_id: int = Form(..., description="任务ID"),
-    device_id: int = Form(..., description="设备ID"),
-    label_ids: str = Form(default="", description="标签ID列表，用逗号分隔，如：1,2,3"),
-    file: UploadFile = File(..., description="ZIP文件，包含一个或多个MCAP文件"),
-    token: str = Header(..., description="JWT token"),
-    db: Session = Depends(get_db)
-):
-    """上传ZIP文件 - 解析ZIP中的MCAP文件（单个或多个） - 需要设备权限和上传操作权限"""
-    # 验证token并获取当前用户
-    current_user = get_current_user(token, db)
-    
-    # 权限检查：检查设备权限
-    if not PermissionUtils.check_device_permission(db, current_user.id, device_id):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="您没有该设备的访问权限"
-        )
-    
-    # 权限检查：检查上传操作权限
-    if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "upload"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="您没有文件上传权限"
-        )
-    
-    # 验证文件类型
-    if not file.filename.endswith('.zip'):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="只支持上传.zip文件"
-        )
-    
-    # 验证任务是否存在
-    task = db.query(models.Task).filter(models.Task.id == task_id).first()
-    if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="任务不存在"
-        )
-    
-    # 验证设备是否存在
-    device = db.query(models.Device).filter(models.Device.id == device_id).first()
-    if not device:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="设备不存在"
-        )
-    
-    # 解析标签ID列表
-    label_id_list = []
-    if label_ids.strip():
-        try:
-            label_id_list = [int(x.strip()) for x in label_ids.split(',') if x.strip()]
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="标签ID格式错误，请使用逗号分隔的整数，如：1,2,3"
-            )
-    
-    # 验证标签是否存在
-    if label_id_list:
-        existing_labels = db.query(models.Label).filter(models.Label.id.in_(label_id_list)).all()
-        existing_label_ids = [label.id for label in existing_labels]
-        missing_label_ids = set(label_id_list) - set(existing_label_ids)
-        if missing_label_ids:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"以下标签不存在: {list(missing_label_ids)}"
-            )
-    
+async def _process_zip_file(
+    file: UploadFile,
+    task_id: int,
+    device_id: int,
+    label_id_list: List[int],
+    current_user: models.User,
+    db: Session
+) -> List[schemas.DataFileOut]:
+    """处理ZIP文件上传（包含一个或多个MCAP文件）"""
     try:
         # 读取ZIP文件内容
         zip_content = await file.read()
