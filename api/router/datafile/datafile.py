@@ -486,7 +486,7 @@ def _process_zip_file_with_progress_background(
         logger.info(f"[Upload ZIP] 后台任务开始 | task_id={task_id} device_id={device_id} user_id={user_id} filename={filename} size={len(file_content)}")
         
         # 更新进度：ZIP文件读取完成
-        _update_progress(upload_task_id, progress_percent=10.0, message="正在解压ZIP文件...")
+        _update_progress(upload_task_id, progress_percent=10.0, message="正在检查ZIP文件内容...")
         
         # 创建临时ZIP文件
         temp_zip_path = None
@@ -499,15 +499,39 @@ def _process_zip_file_with_progress_background(
                 temp_zip_path = tmp_zip.name
                 tmp_zip.write(file_content)
             
+            # 先检查ZIP文件中是否包含MCAP文件（不解压）
+            has_mcap = False
+            with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
+                file_list = zip_ref.namelist()
+                # 检查是否有.mcap文件
+                for file_name in file_list:
+                    if file_name.endswith('.mcap'):
+                        has_mcap = True
+                        break
+            
+            # 如果没有MCAP文件，直接失败（后台任务中不能抛出HTTPException，因为响应已发送）
+            if not has_mcap:
+                _update_progress(
+                    upload_task_id,
+                    status="failed",
+                    progress_percent=10.0,
+                    message="zip包中文件不包含mcap"
+                )
+                logger.error(f"[Upload ZIP] ZIP包中文件不包含mcap | filename={filename}")
+                db.close()
+                return
+            
+            # 更新进度：确认有MCAP文件，开始解压
+            _update_progress(upload_task_id, progress_percent=12.0, message="检测到MCAP文件，正在解压ZIP文件...")
+            
             # 创建临时解压目录
             temp_extract_dir = tempfile.mkdtemp()
             
             # 解压ZIP文件
             with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:
                 zip_ref.extractall(temp_extract_dir)
-                file_list = zip_ref.namelist()
             
-            # 查找所有.mcap文件
+            # 查找所有.mcap文件（只处理MCAP文件，忽略其他类型文件）
             mcap_files = []
             for file_name in file_list:
                 if file_name.endswith('.mcap'):
@@ -516,20 +540,30 @@ def _process_zip_file_with_progress_background(
                     if os.path.isfile(full_path):
                         mcap_files.append((file_name, full_path))
             
+            # 再次确认（双重检查）
             if not mcap_files:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="ZIP文件中未找到.mcap文件"
+                _update_progress(
+                    upload_task_id,
+                    status="failed",
+                    progress_percent=15.0,
+                    message="zip包中文件不包含mcap"
                 )
+                logger.error(f"[Upload ZIP] 解压后未找到MCAP文件 | filename={filename}")
+                db.close()
+                return
             
-            logger.info(f"[Upload ZIP] 找到 {len(mcap_files)} 个MCAP文件")
+            # 统计文件类型信息
+            total_files_count = len(file_list)
+            other_files_count = total_files_count - len(mcap_files)
+            
+            logger.info(f"[Upload ZIP] ZIP包中包含 {total_files_count} 个文件，其中 {len(mcap_files)} 个MCAP文件（将只处理MCAP文件，忽略其他 {other_files_count} 个文件）")
             
             # 更新进度：解压完成，开始处理文件
             _update_progress(
                 upload_task_id,
                 total_files=len(mcap_files),
                 progress_percent=15.0,
-                message=f"找到 {len(mcap_files)} 个MCAP文件，开始处理..."
+                message=f"解压完成，找到 {len(mcap_files)} 个MCAP文件，开始处理（忽略其他类型文件）..."
             )
             
             # 获取S3客户端
@@ -730,12 +764,12 @@ def _process_zip_file_with_progress_background(
                 _update_progress(
                     upload_task_id,
                     status="failed",
+                    progress_percent=100.0,
                     message="所有MCAP文件处理失败"
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="所有MCAP文件处理失败"
-                )
+                logger.error("[Upload ZIP] 所有MCAP文件处理失败")
+                # 注意：后台任务中不能抛出HTTPException，因为响应已发送，只需更新进度状态
+                return
             else:
                 current_progress = upload_tasks.get(upload_task_id)
                 if current_progress and current_progress.failed_files:
@@ -764,8 +798,6 @@ def _process_zip_file_with_progress_background(
                 except Exception:
                     pass
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.exception(f"[Upload ZIP] 后台任务失败: {e}")
         db.rollback()
@@ -774,6 +806,7 @@ def _process_zip_file_with_progress_background(
             status="failed",
             message=f"上传失败: {str(e)}"
         )
+        # 注意：后台任务中不能抛出HTTPException，因为响应已发送，只需更新进度状态
     finally:
         db.close()
 
@@ -1165,12 +1198,12 @@ async def _process_zip_file_with_progress(
                 _update_progress(
                     upload_task_id,
                     status="failed",
+                    progress_percent=100.0,
                     message="所有MCAP文件处理失败"
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="所有MCAP文件处理失败"
-                )
+                logger.error("[Upload ZIP] 所有MCAP文件处理失败")
+                # 注意：后台任务中不能抛出HTTPException，因为响应已发送，只需更新进度状态
+                return
             else:
                 current_progress = upload_tasks.get(upload_task_id)
                 if current_progress and current_progress.failed_files:
