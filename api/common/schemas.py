@@ -509,3 +509,36 @@ class McapInfo(BaseModel):
     calibration_topics: List[str] = []
     annotations: List[Annotation] = []  # 添加注释列表
     metadata: Optional[MetaData] = None
+
+
+class TopicInfo(BaseModel):
+    topic: str
+    msg_count: int
+    fps: float = 0
+
+
+class Annotation(BaseModel):
+    """注释数据结构"""
+    timestamp_ns: int  # 纳秒时间戳
+    text: str  # 注释文本内容
+    frame_index: int = 0  # 对应的帧索引
+
+
+class MetaData(BaseModel):
+    uuid: Optional[str] = None
+    operator_name: Optional[str] = None
+    annotator_name: Optional[str] = None
+    station_id: Optional[str] = None
+    task_command: Optional[str] = None
+
+class McapInfo(BaseModel):
+    start_ns: int
+    end_ns: int
+    duration_sec: float
+    video_fps: float
+    video_frame_count: int
+    topic_infos: List[TopicInfo]
+    video_topics: List[str] = []
+    calibration_topics: List[str] = []
+    annotations: List[Annotation] = []  # 添加注释列表
+    metadata: Optional[MetaData] = None

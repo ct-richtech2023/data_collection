@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFile, File, Form, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
 import uuid
 import zipfile
@@ -15,12 +15,23 @@ import boto3
 from botocore.config import Config as BotoConfig
 from urllib.parse import urlparse
 import yaml
+import aiofiles
+import cv2
+import numpy as np
+import base64
+import json
+import asyncio
+import time
+import sys
 from common.database import get_db
 from common import models, schemas
 from common.permission_utils import PermissionUtils
 from common.mcap_loader import McapReader
 from router.user.auth import get_current_user
 from loguru import logger
+from pathlib import Path
+from common.analyze import McapReader
+from mcap_protobuf.decoder import DecoderFactory
 
 router = APIRouter()
 
@@ -46,6 +57,114 @@ download_tasks: dict = {}
 # 格式: {download_task_id: zip_file_path}
 download_file_paths: dict = {}
 
+# MCAP 查看器全局变量
+mcap_reader = None  # MCAP读取器实例
+mcap_temp_file = None  # S3下载的临时MCAP文件路径
+
+# WebSocket连接管理
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        # 改为每个 WebSocket 可以有多个任务，每个任务对应一个 topic
+        # 格式: {websocket: {topic: task}}
+        self.streaming_tasks: Dict[WebSocket, Dict[str, asyncio.Task]] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"WebSocket连接建立，当前连接数: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        if websocket in self.streaming_tasks:
+            # 取消该 WebSocket 的所有任务
+            for topic, task in self.streaming_tasks[websocket].items():
+                try:
+                    task.cancel()
+                except:
+                    pass
+            del self.streaming_tasks[websocket]
+        logger.info(f"WebSocket连接断开，当前连接数: {len(self.active_connections)}")
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        """发送个人消息，如果连接已断开则静默失败"""
+        try:
+            await websocket.send_text(message)
+        except WebSocketDisconnect:
+            # WebSocket 已断开，静默处理
+            logger.debug("WebSocket已断开，无法发送消息")
+            self.disconnect(websocket)
+        except RuntimeError as e:
+            # RuntimeError 可能包含连接状态错误
+            error_str = str(e)
+            if "not connected" in error_str.lower() or "Need to call \"accept\"" in error_str:
+                logger.debug("WebSocket连接已断开，无法发送消息")
+                self.disconnect(websocket)
+            else:
+                # 其他 RuntimeError，记录日志
+                logger.warning(f"发送消息时发生运行时错误: {e}")
+                self.disconnect(websocket)
+        except Exception as e:
+            # 其他异常，记录日志但静默处理
+            logger.debug(f"发送消息失败，连接可能已断开: {type(e).__name__}: {e}")
+            self.disconnect(websocket)
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections.copy():
+            try:
+                await connection.send_text(message)
+            except:
+                self.disconnect(connection)
+
+# WebSocket连接管理器实例
+websocket_manager = ConnectionManager()
+
+# 全局变量用于错误计数
+_encode_error_count = 0
+
+def encode_image_to_base64(img_data: np.ndarray) -> str:
+    """将numpy数组图像编码为base64字符串，默认使用低质量压缩（优化性能版本）"""
+    if img_data is None:
+        return None
+    
+    try:
+        # 提高JPEG质量以获得更好的图像质量（从30提升到50）
+        jpeg_quality = 50
+        
+        # 增加图像大小限制（从5MB提升到10MB），允许传输更大的图像
+        if img_data.nbytes > 10 * 1024 * 1024:  # 10MB限制
+            # 计算缩放比例
+            scale = (10 * 1024 * 1024 / img_data.nbytes) ** 0.5
+            new_width = int(img_data.shape[1] * scale)
+            new_height = int(img_data.shape[0] * scale)
+            img_data = cv2.resize(img_data, (new_width, new_height))
+        
+        # 优化：使用固定的编码参数列表，避免每次创建
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
+        
+        # 确保图像是BGR格式
+        if len(img_data.shape) == 3 and img_data.shape[2] == 3:
+            # 已经是BGR格式，直接编码
+            _, buffer = cv2.imencode('.jpg', img_data, encode_params)
+        else:
+            # 灰度图像
+            _, buffer = cv2.imencode('.jpg', img_data, encode_params)
+        
+        # 转换为base64（移除日志输出）
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        return f"data:image/jpeg;base64,{img_base64}"
+    except Exception as e:
+        # 错误时只输出简单日志，避免影响性能
+        global _encode_error_count
+        _encode_error_count += 1
+        
+        # 每100次错误才输出一次日志
+        if _encode_error_count % 100 == 0:
+            logger.warning(f"图像编码失败（累计 {_encode_error_count} 次）: {e}")
+        return None
+
 # S3 配置（支持 /etc/data_collection/s3.yaml 与环境变量，环境变量优先）
 S3_CONFIG_FILE = "/etc/data_collection/s3.yaml"
 _S3_CFG = {}
@@ -55,7 +174,7 @@ try:
             _S3_CFG = yaml.safe_load(f) or {}
 except Exception as _e:
     # 配置文件读取失败不阻断启动，后续仍可用环境变量
-    print(f"读取 {S3_CONFIG_FILE} 失败: {_e}")
+    logger.info(f"读取 {S3_CONFIG_FILE} 失败: {_e}")
 
 def _cfg(name: str, default=None):
     return os.getenv(name, _S3_CFG.get(name, default))
@@ -1505,7 +1624,7 @@ def delete_datafile(
     if data_file_labels_count > 0:
         # 删除所有关联的标签映射
         db.query(models.DataFileLabel).filter(models.DataFileLabel.data_file_id == datafile_id).delete()
-        print(f"已删除 {data_file_labels_count} 个关联的标签映射")
+        logger.info(f"已删除 {data_file_labels_count} 个关联的标签映射")
     
     # 删除 S3 或本地物理文件
     try:
@@ -1521,7 +1640,7 @@ def delete_datafile(
                 try:
                     os.remove(file_path)
                 except Exception as e:
-                    print(f"删除物理文件失败: {e}")
+                    logger.info(f"删除物理文件失败: {e}")
     except Exception as e:
         logger.exception(f"[Delete] 存储对象删除失败: {e}")
     
@@ -1973,7 +2092,7 @@ def get_download_status(
 
 
 @router.get("/download_file_by_task/{download_task_id}")
-def download_file_by_task(
+async def download_file_by_task(
     download_task_id: str,
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db)
@@ -2036,39 +2155,38 @@ def download_file_by_task(
     # 从路径获取文件名
     zip_filename = os.path.basename(file_path)
     
-    # 创建生成器函数，下载完成后删除文件（仅本地文件）
-    def generate_and_cleanup():
-        try:
-            with open(file_path, 'rb') as f:
-                chunk_size = 1024 * 1024  # 1MB chunks
-                while True:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield chunk
-        finally:
-            # 下载完成后删除文件（仅本地文件）
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.info(f"[Download ZIP] 临时文件已删除 | path={file_path}")
-            except Exception as e:
-                logger.warning(f"[Download ZIP] 删除临时文件失败 | path={file_path}, error={e}")
-            
-            # 清理任务记录
-            download_tasks.pop(download_task_id, None)
-            download_file_paths.pop(download_task_id, None)
-    
     logger.info(f"[Download ZIP] 开始下载（本地文件） | task_id={download_task_id} file={zip_filename} size={file_size}")
     
+    # 使用异步文件读取，尽快产出首块字节，浏览器会立即显示下载进度
+    # 使用较小的 chunk size 以便更快地发送第一个数据包
+    async def iter_file():
+        """异步迭代文件内容，尽快返回第一个字节"""
+        chunk_size = 512 * 1024  # 512KB chunks - 平衡性能和首字节速度
+        
+        async with aiofiles.open(file_path, 'rb') as f:
+            while True:
+                chunk = await f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    
+    # 设置响应头，确保浏览器能够立即开始下载并显示进度
+    headers = {
+        "Content-Disposition": f'attachment; filename="{zip_filename}"',
+        "Content-Length": str(file_size),  # 必须设置，浏览器才能显示进度
+        "Content-Type": "application/zip",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Accept-Ranges": "bytes",  # 支持断点续传，帮助浏览器处理下载进度
+        # 禁用服务器缓冲，立即开始传输（对nginx等反向代理的提示）
+        "X-Accel-Buffering": "no"
+    }
+    
     return StreamingResponse(
-        generate_and_cleanup(),
+        iter_file(),
         media_type='application/zip',
-        headers={
-            "Content-Disposition": f"attachment; filename={zip_filename}",
-            "Content-Length": str(file_size),
-            "Cache-Control": "no-cache"
-        }
+        headers=headers
     )
 
 
@@ -2109,7 +2227,7 @@ def test_zip_download():
     
     # 获取ZIP文件大小
     zip_size = zip_buffer.tell()
-    print(f"测试ZIP文件大小: {zip_size} 字节")  # 调试信息
+    logger.info(f"测试ZIP文件大小: {zip_size} 字节")  # 调试信息
     
     # 改进的生成器函数
     def generate_zip():
@@ -2301,3 +2419,605 @@ def get_datafiles_with_pagination(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取数据文件信息时发生错误: {str(e)}"
         )
+
+
+
+async def download_mcap_from_s3(s3_url: str) -> str:
+    """从S3下载MCAP文件到临时文件，返回临时文件路径 - 参考 datafile.py 的流式下载实现"""
+    global mcap_temp_file
+    
+    try:
+        bucket, key = parse_s3_url(s3_url)
+        s3 = get_s3_client()
+        
+        logger.info(f"开始从S3下载MCAP文件 | bucket={bucket} key={key}")
+        
+        # 获取文件信息
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        file_size = obj.get('ContentLength', 0)
+        body = obj['Body']
+        
+        # 使用统一的临时目录（参考 datafile.py）
+        temp_dir = "/tmp/data_collection"
+        if not os.path.exists(temp_dir):
+            try:
+                os.makedirs(temp_dir, exist_ok=True, mode=0o755)
+            except Exception as e:
+                logger.info(f"无法创建临时目录 {temp_dir}，使用系统临时目录: {e}")
+                temp_dir = None
+        
+        # 创建临时文件
+        if temp_dir:
+            # 使用key的文件名，如果key包含路径，只取文件名部分
+            filename = os.path.basename(key) or "mcap_file.mcap"
+            if not filename.endswith('.mcap'):
+                filename += '.mcap'
+            temp_path = os.path.join(temp_dir, f"mcap_{filename}")
+        else:
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mcap')
+            temp_path = temp_file.name
+            temp_file.close()
+        
+        # 流式下载文件（参考 datafile.py 的实现，支持大文件）
+        downloaded_bytes = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        with open(temp_path, 'wb') as f:
+            while True:
+                chunk = body.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded_bytes += len(chunk)
+                
+                # 每10MB输出一次进度
+                if downloaded_bytes % (10 * 1024 * 1024) == 0 and file_size > 0:
+                    progress = (downloaded_bytes / file_size * 100)
+                    logger.info(f"S3下载进度: {downloaded_bytes / (1024*1024):.2f} MB / {file_size / (1024*1024):.2f} MB ({progress:.1f}%)")
+        
+        actual_size = os.path.getsize(temp_path)
+        logger.info(f"S3下载完成 | path={temp_path} size={actual_size / (1024*1024):.2f} MB")
+        
+        # 清理之前的临时文件
+        if mcap_temp_file and os.path.exists(mcap_temp_file) and mcap_temp_file != temp_path:
+            try:
+                os.remove(mcap_temp_file)
+                logger.info(f"已清理旧的临时文件: {mcap_temp_file}")
+            except Exception as e:
+                logger.info(f"清理旧临时文件失败: {e}")
+        
+        mcap_temp_file = temp_path
+        return temp_path
+        
+    except ValueError as e:
+        # S3 URL解析错误
+        logger.info(f"S3 URL解析失败: {e}")
+        raise HTTPException(status_code=400, detail=f"无效的S3 URL: {str(e)}")
+    except Exception as e:
+        logger.info(f"从S3下载MCAP文件失败: {e}")
+        import traceback
+        logger.info(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"从S3下载MCAP文件失败: {str(e)}")
+
+# 注释序列化工具
+def _serialize_annotations_from_reader(reader: McapReader):
+    try:
+        anns = reader._load_annotations()
+        result = []
+        for a in anns or []:
+            if isinstance(a, dict):
+                result.append({
+                    "timestamp_ns": a.get("timestamp_ns"),
+                    "text": a.get("text"),
+                    "frame_index": a.get("frame_index")
+                })
+            else:
+                result.append({
+                    "timestamp_ns": getattr(a, "timestamp_ns", None),
+                    "text": getattr(a, "text", None),
+                    "frame_index": getattr(a, "frame_index", None)
+                })
+        return result
+    except Exception:
+        return []
+
+@router.get("/load_mcap")
+async def load_mcap(
+    file_path: Optional[str] = None,
+    file_path_or_s3_url: Optional[str] = None
+):
+    """加载MCAP文件 - 支持本地文件路径或S3 URL (s3://bucket/key)
+    
+    参数支持多种名称（兼容性）：
+    - file_path: 文件路径参数名（兼容旧版本）
+    - file_path_or_s3_url: 完整参数名（支持本地路径或S3 URL）
+    """
+    from fastapi import Query
+    
+    # 兼容多种参数名称，优先使用 file_path_or_s3_url
+    path_or_url = file_path_or_s3_url or file_path
+    
+    if not path_or_url:
+        raise HTTPException(status_code=400, detail="请提供 file_path 或 file_path_or_s3_url 参数")
+    global mcap_reader, mcap_temp_file
+    
+    try:
+        # 关闭之前打开的读取器
+        if mcap_reader:
+            try:
+                mcap_reader.close()
+            except Exception:
+                pass
+            mcap_reader = None
+        
+        local_file_path = None
+        
+        # 判断是S3 URL还是本地路径
+        if path_or_url.startswith("s3://"):
+            # 从S3下载MCAP文件
+            logger.info(f"从S3加载MCAP文件: {path_or_url}")
+            local_file_path = await download_mcap_from_s3(path_or_url)
+        else:
+            # 本地文件路径
+            local_file_path = path_or_url
+            
+            # 处理相对路径 - 如果是相对路径，尝试从当前文件所在目录查找
+            if not local_file_path.startswith('/') and not local_file_path.startswith('C:'):
+                # 先尝试相对于当前 Python 文件所在目录
+                current_dir = Path(__file__).parent
+                potential_path = current_dir / local_file_path
+                if potential_path.exists():
+                    local_file_path = str(potential_path)
+                else:
+                    # 再尝试相对于项目根目录
+                    parent_dir = current_dir.parent.parent
+                    potential_path = parent_dir / local_file_path
+                    if potential_path.exists():
+                        local_file_path = str(potential_path)
+                    else:
+                        # 最后尝试相对于 api 目录
+                        api_dir = current_dir.parent
+                        potential_path = api_dir / local_file_path
+                        if potential_path.exists():
+                            local_file_path = str(potential_path)
+            
+            if not Path(local_file_path).exists():
+                raise HTTPException(status_code=404, detail=f"MCAP文件不存在: {local_file_path}")
+        
+        # 加载MCAP文件
+        logger.info(f"加载MCAP文件: {local_file_path}")
+        mcap_reader = McapReader(local_file_path)
+        
+        return {
+            "success": True,
+            "message": "MCAP文件加载成功",
+            "source": "s3" if path_or_url.startswith("s3://") else "local",
+            "file_info": {
+                "duration_sec": mcap_reader.file_info.duration_sec,
+                "video_fps": mcap_reader.file_info.video_fps,
+                "video_frame_count": mcap_reader.file_info.video_frame_count,
+                "video_topics": mcap_reader.file_info.video_topics
+            },
+            "annotations": _serialize_annotations_from_reader(mcap_reader)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.info(f"加载MCAP文件失败: {e}")
+        import traceback
+        logger.info(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"加载MCAP文件失败: {str(e)}")
+
+
+@router.get("/get_all_topics")
+async def get_all_topics():
+    """获取所有视频topic"""
+    global mcap_reader
+    
+    if mcap_reader is None:
+        raise HTTPException(status_code=400, detail="请先加载MCAP文件")
+    
+    return {
+        "success": True,
+        "topics": mcap_reader.video_topics
+    }
+
+@router.get("/get_annotations")
+async def get_annotations():
+    """获取MCAP文件中的注释列表"""
+    global mcap_reader
+    if mcap_reader is None:
+        raise HTTPException(status_code=400, detail="请先加载MCAP文件")
+    return {
+        "success": True,
+        "annotations": _serialize_annotations_from_reader(mcap_reader)
+    }
+
+
+
+@router.get("/view_mcap")
+async def view_mcap_root():
+    """返回MCAP查看器主页面"""
+    # 使用绝对路径确保能找到HTML文件
+    html_path = Path(__file__).parent / "video_player.html"
+    if html_path.exists():
+        return HTMLResponse(content=open(html_path, "r", encoding="utf-8").read())
+    else:
+        raise HTTPException(status_code=404, detail="MCAP查看器页面不存在")
+
+@router.get("/test_mcap_api")
+async def test_mcap_api():
+    """返回主页面"""
+    # 使用绝对路径确保能找到HTML文件
+    html_path = Path(__file__).parent / "video_player.html"
+    return HTMLResponse(content=open(html_path, "r", encoding="utf-8").read())
+
+@router.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket):
+    """WebSocket实时流式传输"""
+    logger.info(f"WebSocket连接请求: {websocket.client if websocket.client else 'unknown'}")
+    
+    try:
+        await websocket_manager.connect(websocket)
+        logger.info("WebSocket连接已建立，等待客户端消息...")
+        
+        # 发送连接成功消息
+        await websocket_manager.send_personal_message(json.dumps({
+            "type": "connected",
+            "message": "WebSocket连接已建立"
+        }), websocket)
+        
+        while True:
+            try:
+                # 等待客户端消息（如果连接断开，receive_text 会抛出 WebSocketDisconnect）
+                data = await websocket.receive_text()
+                logger.info(f"收到WebSocket消息: {data[:200]}...")  # 只打印前200字符，避免日志过长
+                
+                try:
+                    message = json.loads(data)
+                    logger.info(f"解析后的消息类型: {message.get('action', 'unknown')}")
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON解析失败: {e}, 原始数据: {data[:100]}")
+                    await websocket_manager.send_personal_message(json.dumps({
+                        "type": "error",
+                        "message": f"消息格式错误: {str(e)}"
+                    }), websocket)
+                    continue
+                
+                action = message.get("action")
+                
+                if action == "start_stream":
+                    topic = message.get("topic")
+                    if not topic:
+                        logger.error("缺少topic参数")
+                        await websocket_manager.send_personal_message(json.dumps({
+                            "type": "error",
+                            "message": "缺少topic参数"
+                        }), websocket)
+                        continue
+                    
+                    fps = message.get("fps", 30)
+                    max_frames = message.get("max_frames", 1000)
+                    max_duration_seconds = message.get("max_duration_seconds", None)
+                    
+                    # 限制最大帧数，避免内存问题
+                    max_frames = min(max_frames, 2000)  # 最大2000帧
+                    # 限制最大时长，避免传输时间过长（最大10分钟）
+                    if max_duration_seconds is not None:
+                        max_duration_seconds = min(max_duration_seconds, 600)  # 最大600秒（10分钟）
+                    
+                    logger.info(f"开始流式传输 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒")
+                    
+                    # 初始化该 WebSocket 的任务字典（如果不存在）
+                    if websocket not in websocket_manager.streaming_tasks:
+                        websocket_manager.streaming_tasks[websocket] = {}
+                    
+                    # 检查该 topic 是否已有正在运行的任务，如果有则先取消
+                    if topic in websocket_manager.streaming_tasks[websocket]:
+                        old_task = websocket_manager.streaming_tasks[websocket][topic]
+                        try:
+                            old_task.cancel()
+                            await asyncio.wait_for(old_task, timeout=1.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+                        finally:
+                            if topic in websocket_manager.streaming_tasks[websocket]:
+                                del websocket_manager.streaming_tasks[websocket][topic]
+                    
+                    # 启动新的流式传输任务（允许多个任务并行运行，每个 topic 一个任务）
+                    task = asyncio.create_task(stream_video_frames(websocket, topic, fps, max_frames, max_duration_seconds))
+                    websocket_manager.streaming_tasks[websocket][topic] = task
+                    logger.info(f"流式传输任务已启动，Topic: {topic} (当前活跃任务数: {len(websocket_manager.streaming_tasks[websocket])})")
+                    
+                    # 发送确认消息
+                    await websocket_manager.send_personal_message(json.dumps({
+                        "type": "started",
+                        "message": f"流式传输已启动: {topic}",
+                        "topic": topic
+                    }), websocket)
+                    
+                elif action == "stop_stream":
+                    stop_topic = message.get("topic")  # 支持停止特定 topic 或停止所有
+                    logger.info(f"收到停止流式传输命令，Topic: {stop_topic or 'all'}")
+                    
+                    if websocket in websocket_manager.streaming_tasks:
+                        if stop_topic:
+                            # 停止指定 topic 的任务
+                            if stop_topic in websocket_manager.streaming_tasks[websocket]:
+                                task = websocket_manager.streaming_tasks[websocket][stop_topic]
+                                try:
+                                    task.cancel()
+                                    try:
+                                        await asyncio.wait_for(task, timeout=1.0)
+                                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                                        pass
+                                finally:
+                                    if stop_topic in websocket_manager.streaming_tasks[websocket]:
+                                        del websocket_manager.streaming_tasks[websocket][stop_topic]
+                                logger.info(f"流式传输任务已停止，Topic: {stop_topic}")
+                                
+                                await websocket_manager.send_personal_message(json.dumps({
+                                    "type": "stopped",
+                                    "message": f"流式传输已停止，Topic: {stop_topic}",
+                                    "topic": stop_topic
+                                }), websocket)
+                            else:
+                                logger.warning(f"没有正在运行的流式传输任务，Topic: {stop_topic}")
+                        else:
+                            # 停止所有任务
+                            tasks_to_stop = list(websocket_manager.streaming_tasks[websocket].items())
+                            for topic, task in tasks_to_stop:
+                                try:
+                                    task.cancel()
+                                    try:
+                                        await asyncio.wait_for(task, timeout=1.0)
+                                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                                        pass
+                                finally:
+                                    if topic in websocket_manager.streaming_tasks[websocket]:
+                                        del websocket_manager.streaming_tasks[websocket][topic]
+                            
+                            # 如果所有任务都停止了，清理字典
+                            if not websocket_manager.streaming_tasks[websocket]:
+                                del websocket_manager.streaming_tasks[websocket]
+                            
+                            logger.info(f"所有流式传输任务已停止 (共 {len(tasks_to_stop)} 个)")
+                            
+                            await websocket_manager.send_personal_message(json.dumps({
+                                "type": "stopped",
+                                "message": f"所有流式传输任务已停止 (共 {len(tasks_to_stop)} 个)"
+                            }), websocket)
+                    else:
+                        logger.warning("没有正在运行的流式传输任务")
+                        
+                else:
+                    logger.warning(f"未知的action: {action}")
+                    await websocket_manager.send_personal_message(json.dumps({
+                        "type": "error",
+                        "message": f"未知的action: {action}"
+                    }), websocket)
+                    
+            except WebSocketDisconnect:
+                logger.info("WebSocket客户端断开连接（在消息处理中）")
+                break
+            except asyncio.CancelledError:
+                logger.info("WebSocket任务被取消")
+                break
+            except RuntimeError as e:
+                # RuntimeError 可能包含连接状态错误
+                error_str = str(e)
+                if "not connected" in error_str.lower() or "Need to call \"accept\"" in error_str:
+                    logger.info("WebSocket连接已断开，退出消息循环")
+                    break
+                else:
+                    logger.error(f"处理WebSocket消息时发生运行时错误: {e}", exc_info=True)
+                    # 尝试发送错误消息，但如果连接已断开则忽略
+                    try:
+                        await websocket_manager.send_personal_message(json.dumps({
+                            "type": "error",
+                            "message": f"处理消息时发生错误: {str(e)}"
+                        }), websocket)
+                    except:
+                        pass  # 如果发送失败，连接可能已断开
+            except Exception as e:
+                logger.error(f"处理WebSocket消息时发生错误: {e}", exc_info=True)
+                # 尝试发送错误消息，但如果连接已断开则忽略
+                try:
+                    await websocket_manager.send_personal_message(json.dumps({
+                        "type": "error",
+                        "message": f"处理消息时发生错误: {str(e)}"
+                    }), websocket)
+                except:
+                    pass  # 如果发送失败，可能是连接已断开
+                    
+    except WebSocketDisconnect:
+        logger.info("WebSocket客户端主动断开连接")
+        websocket_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket连接错误: {e}", exc_info=True)
+        websocket_manager.disconnect(websocket)
+
+async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_frames: int, max_duration_seconds: Optional[float] = None):
+    """流式传输视频帧，默认使用低质量压缩
+    
+    Args:
+        websocket: WebSocket连接
+        topic: 视频topic
+        fps: 帧率
+        max_frames: 最大帧数限制
+        max_duration_seconds: 最大传输时长（秒），None表示不限制时间
+    """
+    global mcap_reader
+    
+    logger.info(f"开始流式传输函数 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒")
+    # 打印图像编码配置（从encode_image_to_base64函数中获取实际配置）
+    max_image_size_mb = 10  # 与encode_image_to_base64函数中的限制保持一致
+    jpeg_quality = 50  # 与encode_image_to_base64函数中的质量保持一致
+    logger.info(f"使用默认低质量压缩 (JPEG质量: {jpeg_quality}, 最大图像大小: {max_image_size_mb}MB)")
+    
+    if mcap_reader is None:
+        error_msg = "MCAP文件未加载，请先调用 /datafile/load_mcap 接口加载MCAP文件"
+        logger.error(error_msg)
+        try:
+            await websocket_manager.send_personal_message(json.dumps({
+                "type": "error",
+                "message": error_msg
+            }), websocket)
+        except:
+            pass  # 如果发送失败，可能是连接已断开
+        return
+    
+    logger.info(f"MCAP文件路径: {mcap_reader.mcap_path}")
+    logger.info(f"可用的video_topics: {mcap_reader.video_topics}")
+    
+    if topic not in mcap_reader.video_topics:
+        error_msg = f"Topic {topic} 不存在，可用的topics: {list(mcap_reader.video_topics)[:5]}..."
+        logger.error(error_msg)
+        try:
+            await websocket_manager.send_personal_message(json.dumps({
+                "type": "error", 
+                "message": error_msg
+            }), websocket)
+        except:
+            pass  # 如果发送失败，可能是连接已断开
+        return
+    
+    try:
+        frame_count = 0
+        frame_interval = 1.0 / fps  # 帧间隔（秒）
+        start_time = time.time()  # 记录开始时间
+        last_frame_time = start_time  # 用于动态调整帧间隔
+        total_transmitted_kb = 0  # 累计总传输的数据量（KB）
+        
+        # 减少sleep的使用，只在需要控制帧率时使用
+        need_frame_rate_control = frame_interval > 0.01  # 只有帧率低于100fps时才需要控制
+        
+        logger.info(f"帧间隔: {frame_interval} 秒")
+        logger.info(f"开始读取MCAP文件中的消息...")
+        
+        with open(mcap_reader.mcap_path, "rb") as f:
+            reader = make_reader(f, decoder_factories=[DecoderFactory()])
+            
+            message_count = 0
+            for schema, channel, message, proto_msg in reader.iter_decoded_messages(topics=[topic]):
+                message_count += 1
+                
+                # 检查是否达到最大帧数限制
+                if frame_count >= max_frames:
+                    logger.info(f"达到最大帧数限制 {max_frames}，停止处理")
+                    break
+                
+                # 检查是否超过最大传输时长（每10帧或前几帧检查一次以优化性能）
+                if max_duration_seconds is not None and (frame_count < 10 or frame_count % 10 == 0):
+                    elapsed_time = time.time() - start_time
+                    if elapsed_time >= max_duration_seconds:
+                        logger.info(f"达到最大传输时长限制 {max_duration_seconds}秒（已传输 {elapsed_time:.1f}秒），停止处理")
+                        break
+                
+                try:
+                    # 处理视频消息（移除详细日志）
+                    frame = mcap_reader._process_video_message(schema, channel, message, proto_msg)
+                    
+                    if frame is not None:
+                        # 增加图像大小限制（从20MB提升到30MB），允许处理更大的原始帧
+                        if frame.nbytes > 30 * 1024 * 1024:  # 30MB限制
+                            continue
+                        
+                        # 编码图像为base64（移除详细日志）
+                        img_base64 = encode_image_to_base64(frame)
+                        if img_base64:
+                            # 简化计算，只在需要时计算压缩信息（每100帧计算一次用于统计）
+                            if frame_count % 100 == 0:
+                                base64_size_kb = len(img_base64) / 1024
+                                original_size_kb = frame.nbytes / 1024
+                                compression_ratio = (1 - len(img_base64) / frame.nbytes) * 100
+                            else:
+                                # 大部分情况下不计算，节省CPU
+                                base64_size_kb = 0
+                                original_size_kb = 0
+                                compression_ratio = 0
+                            
+                            frame_data = {
+                                "type": "frame",
+                                "frame_index": frame_count,
+                                "timestamp": message.log_time,
+                                "topic": topic,
+                                "image_data": img_base64,
+                                "shape": frame.shape,
+                                "dtype": str(frame.dtype),
+                                "original_size_kb": round(original_size_kb, 1) if base64_size_kb > 0 else None,
+                                "compressed_size_kb": round(base64_size_kb, 1) if base64_size_kb > 0 else None,
+                                "compression_ratio": round(compression_ratio, 1) if compression_ratio > 0 else None
+                            }
+                            
+                            # 发送帧数据（移除详细日志）
+                            json_str = json.dumps(frame_data)
+                            await websocket_manager.send_personal_message(json_str, websocket)
+                            # 累计传输的数据量（JSON字符串大小）
+                            total_transmitted_kb += len(json_str) / 1024
+                            frame_count += 1
+                            
+                            # 动态控制帧率 - 根据实际处理速度调整
+                            if need_frame_rate_control:
+                                current_time = time.time()
+                                actual_interval = current_time - last_frame_time
+                                last_frame_time = current_time
+                                
+                                # 如果处理速度慢于目标帧率，不sleep；如果快于目标帧率，才sleep
+                                if actual_interval < frame_interval:
+                                    sleep_time = frame_interval - actual_interval
+                                    if sleep_time > 0.001:  # 只sleep超过1ms的情况
+                                        await asyncio.sleep(min(sleep_time, 0.05))
+                            
+                            # 优化内存清理频率（减少频率）
+                            if frame_count % 100 == 0 and frame_count > 200:
+                                import gc
+                                gc.collect()
+                            
+                            # 减少日志输出频率（每100帧输出一次）
+                            if frame_count % 100 == 0:
+                                elapsed = time.time() - start_time
+                                current_fps = frame_count / elapsed if elapsed > 0 else 0
+                                # 计算平均每帧传输的数据量
+                                avg_size_per_frame_kb = total_transmitted_kb / frame_count if frame_count > 0 else 0
+                                logger.info(f"已流式传输 {frame_count} 帧，耗时 {elapsed:.1f}秒，平均帧率: {current_fps:.1f} FPS，已传输: {total_transmitted_kb:.2f}KB (平均每帧: {avg_size_per_frame_kb:.2f}KB)")
+                
+                except asyncio.CancelledError:
+                    logger.info("检测到任务取消，停止读取帧...")
+                    raise
+                except Exception as e:
+                    # 错误日志保留，但减少详细trace
+                    if frame_count % 10 == 0:  # 每10帧才输出一次错误详情
+                        logger.info(f"处理 {topic} 第 {frame_count} 帧时出错: {e}")
+                    continue
+        
+        elapsed_time = time.time() - start_time
+        # 获取视频总时长
+        video_duration = mcap_reader.file_info.duration_sec if mcap_reader.file_info else 0
+        # 计算总传输数据量（KB和MB）
+        total_transmitted_mb = total_transmitted_kb / 1024
+        logger.info(f"流式传输结束 - 总消息数: {message_count}, 成功帧数: {frame_count}, 总耗时: {elapsed_time:.2f}秒, 视频时长: {video_duration:.2f}秒, 总传输数据: {total_transmitted_kb:.2f}KB ({total_transmitted_mb:.2f}MB)")
+        
+        # 发送完成消息
+        await websocket_manager.send_personal_message(json.dumps({
+            "type": "complete",
+            "message": f"流式传输完成，共 {frame_count} 帧，处理了 {message_count} 条消息，耗时 {elapsed_time:.2f}秒，视频时长: {video_duration:.2f}秒，总传输数据: {total_transmitted_kb:.2f}KB ({total_transmitted_mb:.2f}MB)"
+        }), websocket)
+        
+    except asyncio.CancelledError:
+        logger.info("流式传输任务已取消")
+        # 可选：通知前端已停止
+        try:
+            await websocket_manager.send_personal_message(json.dumps({
+                "type": "stopped",
+                "message": "已停止流式传输"
+            }), websocket)
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        logger.exception(f"流式传输失败: {e}")
+        await websocket_manager.send_personal_message(json.dumps({
+            "type": "error",
+            "message": f"流式传输失败: {str(e)}"
+        }), websocket)
