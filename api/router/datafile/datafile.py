@@ -29,6 +29,11 @@ UPLOAD_DIR = "uploads"
 if not os.path.exists(UPLOAD_DIR):
     os.makedirs(UPLOAD_DIR)
 
+# 配置临时下载目录
+TMP_DOWNLOAD_DIR = "/tmp/data_collection"
+if not os.path.exists(TMP_DOWNLOAD_DIR):
+    os.makedirs(TMP_DOWNLOAD_DIR, exist_ok=True)
+
 # 上传任务状态存储（内存字典，key: upload_task_id, value: UploadProgress）
 # 格式: {upload_task_id: UploadProgress}
 upload_tasks: dict = {}
@@ -1742,7 +1747,7 @@ def _process_download_zip_background(
         
         # 直接创建本地ZIP文件路径
         zip_filename = f"datafiles_{len(file_info_list)}_files_{download_task_id[:8]}.zip"
-        temp_zip_path = os.path.join(UPLOAD_DIR, zip_filename)
+        temp_zip_path = os.path.join(TMP_DOWNLOAD_DIR, zip_filename)
         
         total_files = len(file_info_list)
         
@@ -1912,8 +1917,8 @@ def _process_download_zip_background(
             message="正在生成下载链接..."
         )
         
-        # 生成临时下载链接
-        temp_download_url = f"/downloads/{zip_filename}"
+        # 生成临时下载链接（相对于 /tmp/data_collection）
+        temp_download_url = f"/tmp/data_collection/{zip_filename}"
         
         # 保存文件路径，用于下载后清理
         download_file_paths[download_task_id] = temp_zip_path
@@ -2010,9 +2015,13 @@ def download_file_by_task(
     else:
         # 从download_url解析文件路径
         if progress.download_url:
-            if progress.download_url.startswith("/downloads/"):
-                file_path = progress.download_url.replace("/downloads/", UPLOAD_DIR + "/")
+            if progress.download_url.startswith("/tmp/data_collection/"):
+                file_path = progress.download_url.replace("/tmp/data_collection/", TMP_DOWNLOAD_DIR + "/")
+            elif progress.download_url.startswith("/downloads/"):
+                # 兼容旧路径
+                file_path = progress.download_url.replace("/downloads/", TMP_DOWNLOAD_DIR + "/")
             elif progress.download_url.startswith("/uploads/"):
+                # 兼容旧路径
                 file_path = progress.download_url.replace("/uploads/", UPLOAD_DIR + "/")
     
     if not file_path or not os.path.exists(file_path):

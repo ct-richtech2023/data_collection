@@ -50,6 +50,7 @@ except Exception as e:
     logger.warning(f"日志文件无法写入 {log_path}: {e}")
 app.mount('/static', StaticFiles(directory=SwaggerUIFiles.current_dir), name='static')
 app.mount('/uploads', StaticFiles(directory='uploads'), name='uploads')
+app.mount('/tmp/data_collection', StaticFiles(directory='/tmp/data_collection'), name='temp_downloads')
 
 # 挂载API
 app.include_router(datafile_router)
