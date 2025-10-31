@@ -334,12 +334,12 @@ def _process_single_mcap_with_progress_background(
                     pass
         
         # 更新进度：解析完成，开始上传到S3
-        _update_progress(upload_task_id, progress_percent=40.0, message="正在上传到S3...")
+        _update_progress(upload_task_id, progress_percent=10.0, message="正在上传到S3...")
         
         # 创建进度回调函数
         total_size = len(file_content)
-        upload_progress_start = 40.0
-        upload_progress_end = 70.0
+        upload_progress_start = 10.0
+        upload_progress_end = 99.0  # S3上传占89%
         upload_progress_range = upload_progress_end - upload_progress_start
         
         # 创建进度回调函数（优化更新频率，避免过于频繁的更新）
@@ -427,8 +427,8 @@ def _process_single_mcap_with_progress_background(
         logger.info(f"[S3] 上传成功 | key={unique_key} bucket={S3_BUCKET_NAME} duration_ms={duration_ms} size={total_size}")
         download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
         
-        # 更新进度：S3上传完成
-        _update_progress(upload_task_id, progress_percent=70.0, message="S3上传完成，正在保存数据库记录...")
+        # 更新进度：S3上传完成，开始保存数据库记录和操作日志
+        _update_progress(upload_task_id, progress_percent=99.0, message="S3上传完成，正在保存数据库记录...")
         
         # 创建数据文件记录
         db_datafile = models.DataFile(
@@ -451,9 +451,6 @@ def _process_single_mcap_with_progress_background(
                 )
                 db.add(db_datafile_label)
         
-        # 更新进度：数据库记录创建完成
-        _update_progress(upload_task_id, progress_percent=90.0, message="正在创建操作日志...")
-        
         # 创建文件上传操作日志
         from common.operation_log_util import OperationLogUtil
         OperationLogUtil.log_file_upload(
@@ -464,7 +461,7 @@ def _process_single_mcap_with_progress_background(
         db.commit()
         db.refresh(db_datafile)
         
-        # 更新进度：完成
+        # 更新进度：数据库保存和操作日志完成（总共1%），任务完成
         _update_progress(
             upload_task_id,
             progress_percent=100.0,
