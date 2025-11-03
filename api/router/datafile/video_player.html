@@ -320,13 +320,19 @@
 
         <div class="controls">
             <div class="control-group">
+                <label for="token">认证Token:</label>
+                <input type="password" id="token" value="richtech" placeholder="输入JWT token（默认: richtech）" style="flex: 1; min-width: 300px;">
+                <button onclick="saveToken()" style="padding: 12px 20px; background: #28a745;">💾 保存Token</button>
+            </div>
+            
+            <div class="control-group">
                 <label for="filePath">MCAP文件路径:</label>
                 <input type="text" id="filePath" value="20250817_144725.mcap" placeholder="输入MCAP文件路径">
             </div>
             
             <div class="control-group">
                 <label for="maxFrames">最大帧数:</label>
-                <input type="number" id="maxFrames" value="100" min="1" max="1000">
+                <input type="number" id="maxFrames" value="1000" min="1" max="5000">
             </div>
             
             
@@ -390,6 +396,34 @@
         const WS_PORT = SERVER_CONFIG.httpPort;  // WebSocket 使用 HTTP 端口
         const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const WS_BASE_URL = `${WS_PROTOCOL}//${SERVER_CONFIG.host}:${WS_PORT}`;
+        
+        // Token管理
+        const TOKEN_STORAGE_KEY = 'mcap_player_token';
+        
+        // 获取token（优先从localStorage，否则使用默认值）
+        function getToken() {
+            const savedToken = localStorage.getItem(TOKEN_STORAGE_KEY);
+            const inputToken = document.getElementById('token').value.trim();
+            return inputToken || savedToken || 'richtech';
+        }
+        
+        // 保存token到localStorage
+        function saveToken() {
+            const token = document.getElementById('token').value.trim();
+            if (!token) {
+                showStatus('Token不能为空', 'error');
+                return;
+            }
+            localStorage.setItem(TOKEN_STORAGE_KEY, token);
+            showStatus('Token已保存到本地存储', 'success');
+        }
+        
+        // 创建带token的请求头
+        function getAuthHeaders() {
+            return {
+                'token': getToken()
+            };
+        }
         
         let currentFrames = [];
         let currentFrameIndex = 0;
@@ -465,10 +499,28 @@
                 return;
             }
 
+            const token = getToken();
+            if (!token) {
+                showStatus('请输入认证Token', 'error');
+                return;
+            }
+
             showLoading(true);
             try {
-                // 使用正确的路径和参数名
-                const response = await fetch(`${API_BASE_URL}/datafile/load_mcap?file_path=${encodeURIComponent(filePath)}`);
+                // 使用正确的路径和参数名，添加token header
+                const response = await fetch(`${API_BASE_URL}/datafile/load_mcap?file_path_or_s3_url=${encodeURIComponent(filePath)}`, {
+                    method: 'GET',
+                    headers: getAuthHeaders()
+                });
+                
+                if (!response.ok) {
+                    if (response.status === 401 || response.status === 403) {
+                        showStatus('认证失败，请检查Token是否正确', 'error');
+                        return;
+                    }
+                    throw new Error(`HTTP错误: ${response.status}`);
+                }
+                
                 const data = await response.json();
                 
                 if (data.success) {
@@ -479,12 +531,18 @@
                         setupAnnotations(data.annotations);
                     } else {
                         try {
-                            const annRes = await fetch(`${API_BASE_URL}/datafile/get_annotations`);
-                            const annData = await annRes.json();
-                            if (annData.success && Array.isArray(annData.annotations)) {
-                                setupAnnotations(annData.annotations);
+                            const annRes = await fetch(`${API_BASE_URL}/datafile/get_annotations`, {
+                                headers: getAuthHeaders()
+                            });
+                            if (annRes.ok) {
+                                const annData = await annRes.json();
+                                if (annData.success && Array.isArray(annData.annotations)) {
+                                    setupAnnotations(annData.annotations);
+                                }
                             }
-                        } catch (e) {}
+                        } catch (e) {
+                            console.warn('获取注释失败:', e);
+                        }
                     }
                 } else {
                     showStatus('MCAP文件加载失败: ' + data.message, 'error');
@@ -530,9 +588,26 @@
 
         // 获取所有topic
         async function loadTopics() {
+            const token = getToken();
+            if (!token) {
+                showStatus('请输入认证Token', 'error');
+                return;
+            }
+            
             showLoading(true);
             try {
-                const response = await fetch(`${API_BASE_URL}/datafile/get_all_topics`);
+                const response = await fetch(`${API_BASE_URL}/datafile/get_all_topics`, {
+                    headers: getAuthHeaders()
+                });
+                
+                if (!response.ok) {
+                    if (response.status === 401 || response.status === 403) {
+                        showStatus('认证失败，请检查Token是否正确', 'error');
+                        return;
+                    }
+                    throw new Error(`HTTP错误: ${response.status}`);
+                }
+                
                 const data = await response.json();
                 
                 if (data.success) {
@@ -622,22 +697,32 @@
                 // 初始化多摄像头显示
                 initializeMultiCameraDisplay();
                 
+                // 获取token并构建WebSocket URL（添加token作为查询参数）
+                const token = getToken();
+                if (!token) {
+                    showStatus('请输入认证Token', 'error');
+                    return;
+                }
+                
                 // 建立WebSocket连接（FastAPI WebSocket 和 HTTP API 在同一个端口）
-                const wsUrl = `${WS_PROTOCOL}//${SERVER_CONFIG.host}:${SERVER_CONFIG.httpPort}/datafile/ws/stream`;
-                console.log(`正在连接WebSocket: ${wsUrl}`);
+                // 将token作为查询参数传递
+                const wsUrl = `${WS_PROTOCOL}//${SERVER_CONFIG.host}:${SERVER_CONFIG.httpPort}/datafile/ws/stream?token=${encodeURIComponent(token)}`;
+                console.log(`正在连接WebSocket: ${wsUrl.substring(0, wsUrl.indexOf('token') + 10)}...`);
                 websocket = new WebSocket(wsUrl);
                 
                 websocket.onopen = function(event) {
                     console.log('WebSocket连接已建立');
                     showStatus(`WebSocket连接已建立，开始流式传输 ${selectedTopics.length} 个相机...`, 'info');
                     
-                    // 为每个选中的相机发送流式传输命令
+                    // 为每个选中的相机发送流式传输命令（包含token确保认证）
+                    const token = getToken();
                     selectedTopics.forEach(topic => {
                         const message = {
                             action: "start_stream",
                             topic: topic,
                             fps: fps,
-                            max_frames: parseInt(maxFrames)
+                            max_frames: parseInt(maxFrames),
+                            token: token  // 在消息中也传递token（如果查询参数失败时使用）
                         };
                         console.log(`发送相机 ${topic} 的WebSocket消息:`, message);
                         websocket.send(JSON.stringify(message));
@@ -1057,6 +1142,15 @@
 
         // 页面加载完成后的初始化
         document.addEventListener('DOMContentLoaded', () => {
+            // 从localStorage加载保存的token
+            const savedToken = localStorage.getItem(TOKEN_STORAGE_KEY);
+            if (savedToken) {
+                document.getElementById('token').value = savedToken;
+                showStatus('已自动加载保存的Token', 'info');
+            } else {
+                // 如果没有保存的token，使用默认值
+                document.getElementById('token').value = 'richtech';
+            }
             showStatus('欢迎使用MCAP实时流播放器！请先加载MCAP文件', 'info');
         });
     </script>

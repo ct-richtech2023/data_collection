@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Header, UploadFil
 from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Union
 import os
 import uuid
 import zipfile
@@ -57,9 +57,10 @@ download_tasks: dict = {}
 # 格式: {download_task_id: zip_file_path}
 download_file_paths: dict = {}
 
-# MCAP 查看器全局变量
-mcap_reader = None  # MCAP读取器实例
-mcap_temp_file = None  # S3下载的临时MCAP文件路径
+# MCAP 查看器存储（支持多用户并发）
+# 格式: {user_id: McapReader} 或 {websocket_id: McapReader}
+mcap_readers: Dict[Union[int, str], McapReader] = {}  # MCAP读取器实例存储
+mcap_temp_files: Dict[Union[int, str], str] = {}  # S3下载的临时MCAP文件路径存储
 
 # WebSocket连接管理
 class ConnectionManager:
@@ -68,6 +69,9 @@ class ConnectionManager:
         # 改为每个 WebSocket 可以有多个任务，每个任务对应一个 topic
         # 格式: {websocket: {topic: task}}
         self.streaming_tasks: Dict[WebSocket, Dict[str, asyncio.Task]] = {}
+        # 存储每个WebSocket连接对应的user_id（支持多用户并发）
+        # 格式: {websocket: user_id}
+        self.websocket_users: Dict[WebSocket, int] = {}
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -85,6 +89,9 @@ class ConnectionManager:
                 except:
                     pass
             del self.streaming_tasks[websocket]
+        # 清理user_id映射
+        if websocket in self.websocket_users:
+            del self.websocket_users[websocket]
         logger.info(f"WebSocket连接断开，当前连接数: {len(self.active_connections)}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
@@ -2422,22 +2429,30 @@ def get_datafiles_with_pagination(
 
 
 
-async def download_mcap_from_s3(s3_url: str) -> str:
-    """从S3下载MCAP文件到临时文件，返回临时文件路径 - 参考 datafile.py 的流式下载实现"""
-    global mcap_temp_file
+async def download_mcap_from_s3_for_user(s3_url: str, user_id: int) -> str:
+    """从S3下载MCAP文件到临时文件，返回临时文件路径（支持多用户并发）
+    
+    Args:
+        s3_url: S3文件URL (s3://bucket/key)
+        user_id: 用户ID，用于创建独立的临时文件
+        
+    Returns:
+        临时文件路径
+    """
+    global mcap_temp_files
     
     try:
         bucket, key = parse_s3_url(s3_url)
         s3 = get_s3_client()
         
-        logger.info(f"开始从S3下载MCAP文件 | bucket={bucket} key={key}")
+        logger.info(f"开始从S3下载MCAP文件 | bucket={bucket} key={key} user_id={user_id}")
         
         # 获取文件信息
         obj = s3.get_object(Bucket=bucket, Key=key)
         file_size = obj.get('ContentLength', 0)
         body = obj['Body']
         
-        # 使用统一的临时目录（参考 datafile.py）
+        # 使用统一的临时目录
         temp_dir = "/tmp/data_collection"
         if not os.path.exists(temp_dir):
             try:
@@ -2446,47 +2461,52 @@ async def download_mcap_from_s3(s3_url: str) -> str:
                 logger.info(f"无法创建临时目录 {temp_dir}，使用系统临时目录: {e}")
                 temp_dir = None
         
-        # 创建临时文件
+        # 创建临时文件（基于user_id生成唯一文件名，避免多用户冲突）
         if temp_dir:
             # 使用key的文件名，如果key包含路径，只取文件名部分
             filename = os.path.basename(key) or "mcap_file.mcap"
             if not filename.endswith('.mcap'):
                 filename += '.mcap'
-            temp_path = os.path.join(temp_dir, f"mcap_{filename}")
+            # 添加user_id确保唯一性
+            temp_path = os.path.join(temp_dir, f"mcap_user_{user_id}_{uuid.uuid4().hex[:8]}_{filename}")
         else:
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mcap')
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.mcap', prefix=f'user_{user_id}_')
             temp_path = temp_file.name
             temp_file.close()
         
-        # 流式下载文件（参考 datafile.py 的实现，支持大文件）
+        # 流式下载文件（支持大文件，使用异步IO实现真正的并发下载）
         downloaded_bytes = 0
         chunk_size = 1024 * 1024  # 1MB chunks
         
-        with open(temp_path, 'wb') as f:
+        # 使用aiofiles进行异步文件写入，支持并发下载
+        async with aiofiles.open(temp_path, 'wb') as f:
             while True:
-                chunk = body.read(chunk_size)
+                # 将同步的S3读取操作放到线程池中执行，避免阻塞事件循环
+                chunk = await asyncio.to_thread(body.read, chunk_size)
                 if not chunk:
                     break
-                f.write(chunk)
+                # 异步写入文件
+                await f.write(chunk)
                 downloaded_bytes += len(chunk)
                 
                 # 每10MB输出一次进度
                 if downloaded_bytes % (10 * 1024 * 1024) == 0 and file_size > 0:
                     progress = (downloaded_bytes / file_size * 100)
-                    logger.info(f"S3下载进度: {downloaded_bytes / (1024*1024):.2f} MB / {file_size / (1024*1024):.2f} MB ({progress:.1f}%)")
+                    logger.info(f"S3下载进度 (用户{user_id}): {downloaded_bytes / (1024*1024):.2f} MB / {file_size / (1024*1024):.2f} MB ({progress:.1f}%)")
         
         actual_size = os.path.getsize(temp_path)
-        logger.info(f"S3下载完成 | path={temp_path} size={actual_size / (1024*1024):.2f} MB")
+        logger.info(f"S3下载完成 | path={temp_path} size={actual_size / (1024*1024):.2f} MB user_id={user_id}")
         
-        # 清理之前的临时文件
-        if mcap_temp_file and os.path.exists(mcap_temp_file) and mcap_temp_file != temp_path:
-            try:
-                os.remove(mcap_temp_file)
-                logger.info(f"已清理旧的临时文件: {mcap_temp_file}")
-            except Exception as e:
-                logger.info(f"清理旧临时文件失败: {e}")
+        # 清理该用户之前的临时文件（如果有）
+        if user_id in mcap_temp_files:
+            old_temp_file = mcap_temp_files[user_id]
+            if old_temp_file and os.path.exists(old_temp_file) and old_temp_file != temp_path:
+                try:
+                    os.remove(old_temp_file)
+                    logger.info(f"已清理用户 {user_id} 的旧临时文件: {old_temp_file}")
+                except Exception as e:
+                    logger.info(f"清理旧临时文件失败: {e}")
         
-        mcap_temp_file = temp_path
         return temp_path
         
     except ValueError as e:
@@ -2498,6 +2518,10 @@ async def download_mcap_from_s3(s3_url: str) -> str:
         import traceback
         logger.info(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"从S3下载MCAP文件失败: {str(e)}")
+
+async def download_mcap_from_s3(s3_url: str) -> str:
+    """从S3下载MCAP文件到临时文件，返回临时文件路径（兼容旧版本，使用默认user_id=0）"""
+    return await download_mcap_from_s3_for_user(s3_url, user_id=0)
 
 # 注释序列化工具
 def _serialize_annotations_from_reader(reader: McapReader):
@@ -2523,43 +2547,57 @@ def _serialize_annotations_from_reader(reader: McapReader):
 
 @router.get("/load_mcap")
 async def load_mcap(
-    file_path: Optional[str] = None,
-    file_path_or_s3_url: Optional[str] = None
+    file_path_or_s3_url: str,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
 ):
     """加载MCAP文件 - 支持本地文件路径或S3 URL (s3://bucket/key)
     
-    参数支持多种名称（兼容性）：
-    - file_path: 文件路径参数名（兼容旧版本）
-    - file_path_or_s3_url: 完整参数名（支持本地路径或S3 URL）
+    参数:
+    - file_path_or_s3_url: 本地文件路径或S3 URL (s3://bucket/key)
+    
+    每个用户独立存储MCAP读取器，支持多用户并发使用
     """
-    from fastapi import Query
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    user_id = current_user.id
     
-    # 兼容多种参数名称，优先使用 file_path_or_s3_url
-    path_or_url = file_path_or_s3_url or file_path
-    
-    if not path_or_url:
-        raise HTTPException(status_code=400, detail="请提供 file_path 或 file_path_or_s3_url 参数")
-    global mcap_reader, mcap_temp_file
+    if not file_path_or_s3_url:
+        raise HTTPException(status_code=400, detail="请提供 file_path_or_s3_url 参数")
+    global mcap_readers, mcap_temp_files
     
     try:
-        # 关闭之前打开的读取器
-        if mcap_reader:
+        # 关闭该用户之前打开的读取器
+        if user_id in mcap_readers:
+            old_reader = mcap_readers[user_id]
             try:
-                mcap_reader.close()
+                old_reader.close()
             except Exception:
                 pass
-            mcap_reader = None
+            del mcap_readers[user_id]
+        
+        # 清理该用户之前的临时文件
+        if user_id in mcap_temp_files:
+            old_temp_file = mcap_temp_files[user_id]
+            if old_temp_file and os.path.exists(old_temp_file) and old_temp_file != file_path_or_s3_url:
+                try:
+                    os.remove(old_temp_file)
+                    logger.info(f"已清理用户 {user_id} 的旧临时文件: {old_temp_file}")
+                except Exception:
+                    pass
         
         local_file_path = None
+        is_s3_source = False
         
         # 判断是S3 URL还是本地路径
-        if path_or_url.startswith("s3://"):
+        if file_path_or_s3_url.startswith("s3://"):
             # 从S3下载MCAP文件
-            logger.info(f"从S3加载MCAP文件: {path_or_url}")
-            local_file_path = await download_mcap_from_s3(path_or_url)
+            is_s3_source = True
+            logger.info(f"从S3加载MCAP文件: {file_path_or_s3_url} (用户ID: {user_id})")
+            local_file_path = await download_mcap_from_s3_for_user(file_path_or_s3_url, user_id)
         else:
             # 本地文件路径
-            local_file_path = path_or_url
+            local_file_path = file_path_or_s3_url
             
             # 处理相对路径 - 如果是相对路径，尝试从当前文件所在目录查找
             if not local_file_path.startswith('/') and not local_file_path.startswith('C:'):
@@ -2585,13 +2623,21 @@ async def load_mcap(
                 raise HTTPException(status_code=404, detail=f"MCAP文件不存在: {local_file_path}")
         
         # 加载MCAP文件
-        logger.info(f"加载MCAP文件: {local_file_path}")
+        logger.info(f"加载MCAP文件: {local_file_path} (用户ID: {user_id})")
         mcap_reader = McapReader(local_file_path)
+        
+        # 基于user_id存储读取器和临时文件路径
+        mcap_readers[user_id] = mcap_reader
+        if is_s3_source:
+            mcap_temp_files[user_id] = local_file_path
+        else:
+            # 本地文件不需要存储临时路径
+            mcap_temp_files.pop(user_id, None)
         
         return {
             "success": True,
             "message": "MCAP文件加载成功",
-            "source": "s3" if path_or_url.startswith("s3://") else "local",
+            "source": "s3" if is_s3_source else "local",
             "file_info": {
                 "duration_sec": mcap_reader.file_info.duration_sec,
                 "video_fps": mcap_reader.file_info.video_fps,
@@ -2610,29 +2656,45 @@ async def load_mcap(
 
 
 @router.get("/get_all_topics")
-async def get_all_topics():
-    """获取所有视频topic"""
-    global mcap_reader
+async def get_all_topics(
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取所有视频topic（支持多用户并发）"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    user_id = current_user.id
     
-    if mcap_reader is None:
-        raise HTTPException(status_code=400, detail="请先加载MCAP文件")
+    global mcap_readers
     
+    if user_id not in mcap_readers:
+        raise HTTPException(status_code=400, detail="请先加载MCAP文件（调用 /load_mcap 接口）")
+    
+    mcap_reader = mcap_readers[user_id]
     return {
         "success": True,
         "topics": mcap_reader.video_topics
     }
 
 @router.get("/get_annotations")
-async def get_annotations():
-    """获取MCAP文件中的注释列表"""
-    global mcap_reader
-    if mcap_reader is None:
-        raise HTTPException(status_code=400, detail="请先加载MCAP文件")
+async def get_annotations(
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """获取MCAP文件中的注释列表（支持多用户并发）"""
+    # 验证token并获取当前用户
+    current_user = get_current_user(token, db)
+    user_id = current_user.id
+    
+    global mcap_readers
+    if user_id not in mcap_readers:
+        raise HTTPException(status_code=400, detail="请先加载MCAP文件（调用 /load_mcap 接口）")
+    
+    mcap_reader = mcap_readers[user_id]
     return {
         "success": True,
         "annotations": _serialize_annotations_from_reader(mcap_reader)
     }
-
 
 
 @router.get("/view_mcap")
@@ -2645,17 +2707,45 @@ async def view_mcap_root():
     else:
         raise HTTPException(status_code=404, detail="MCAP查看器页面不存在")
 
-@router.get("/test_mcap_api")
-async def test_mcap_api():
-    """返回主页面"""
-    # 使用绝对路径确保能找到HTML文件
-    html_path = Path(__file__).parent / "video_player.html"
-    return HTMLResponse(content=open(html_path, "r", encoding="utf-8").read())
 
 @router.websocket("/ws/stream")
-async def websocket_stream(websocket: WebSocket):
-    """WebSocket实时流式传输"""
+async def websocket_stream(websocket: WebSocket, token: Optional[str] = None):
+    """WebSocket实时流式传输（支持多用户并发）
+    
+    可选查询参数:
+    - token: JWT token，用于识别用户身份并获取对应的MCAP读取器
+    客户端可以通过以下方式传递token:
+    1. 查询参数: ws://host/ws/stream?token=xxx
+    2. 在start_stream消息中包含token或user_id字段
+    """
+    from fastapi import Query
+    from common.database import SessionLocal
+    
     logger.info(f"WebSocket连接请求: {websocket.client if websocket.client else 'unknown'}")
+    
+    # 尝试从查询参数获取token并解析user_id（从websocket.query_params获取）
+    user_id = None
+    query_token = websocket.query_params.get("token") if websocket.query_params else None
+    if query_token:
+        token = query_token
+    elif token:
+        # 如果函数参数中有token，使用它
+        pass
+    else:
+        token = None
+    
+    if token:
+        try:
+            db = SessionLocal()
+            try:
+                current_user = get_current_user(token, db)
+                user_id = current_user.id
+                websocket_manager.websocket_users[websocket] = user_id
+                logger.info(f"WebSocket连接已识别用户: user_id={user_id}")
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"WebSocket token验证失败: {e}，将使用连接对象作为标识")
     
     try:
         await websocket_manager.connect(websocket)
@@ -2664,7 +2754,7 @@ async def websocket_stream(websocket: WebSocket):
         # 发送连接成功消息
         await websocket_manager.send_personal_message(json.dumps({
             "type": "connected",
-            "message": "WebSocket连接已建立"
+            "message": "WebSocket连接已建立" + (f"，用户ID: {user_id}" if user_id else "")
         }), websocket)
         
         while True:
@@ -2696,6 +2786,30 @@ async def websocket_stream(websocket: WebSocket):
                         }), websocket)
                         continue
                     
+                    # 尝试从消息中获取token或user_id（如果WebSocket连接时未提供）
+                    stream_user_id = user_id
+                    if not stream_user_id and websocket in websocket_manager.websocket_users:
+                        stream_user_id = websocket_manager.websocket_users[websocket]
+                    
+                    # 如果消息中包含token，尝试解析获取user_id
+                    if not stream_user_id and message.get("token"):
+                        try:
+                            db = SessionLocal()
+                            try:
+                                current_user = get_current_user(message.get("token"), db)
+                                stream_user_id = current_user.id
+                                websocket_manager.websocket_users[websocket] = stream_user_id
+                                logger.info(f"从消息中获取到user_id: {stream_user_id}")
+                            finally:
+                                db.close()
+                        except Exception as e:
+                            logger.warning(f"从消息token解析user_id失败: {e}")
+                    
+                    # 如果消息中直接包含user_id，使用它
+                    if message.get("user_id"):
+                        stream_user_id = message.get("user_id")
+                        websocket_manager.websocket_users[websocket] = stream_user_id
+                    
                     fps = message.get("fps", 30)
                     max_frames = message.get("max_frames", 1000)
                     max_duration_seconds = message.get("max_duration_seconds", None)
@@ -2706,7 +2820,7 @@ async def websocket_stream(websocket: WebSocket):
                     if max_duration_seconds is not None:
                         max_duration_seconds = min(max_duration_seconds, 600)  # 最大600秒（10分钟）
                     
-                    logger.info(f"开始流式传输 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒")
+                    logger.info(f"开始流式传输 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒, User ID: {stream_user_id}")
                     
                     # 初始化该 WebSocket 的任务字典（如果不存在）
                     if websocket not in websocket_manager.streaming_tasks:
@@ -2725,7 +2839,7 @@ async def websocket_stream(websocket: WebSocket):
                                 del websocket_manager.streaming_tasks[websocket][topic]
                     
                     # 启动新的流式传输任务（允许多个任务并行运行，每个 topic 一个任务）
-                    task = asyncio.create_task(stream_video_frames(websocket, topic, fps, max_frames, max_duration_seconds))
+                    task = asyncio.create_task(stream_video_frames(websocket, topic, fps, max_frames, max_duration_seconds, user_id=stream_user_id))
                     websocket_manager.streaming_tasks[websocket][topic] = task
                     logger.info(f"流式传输任务已启动，Topic: {topic} (当前活跃任务数: {len(websocket_manager.streaming_tasks[websocket])})")
                     
@@ -2837,8 +2951,8 @@ async def websocket_stream(websocket: WebSocket):
         logger.error(f"WebSocket连接错误: {e}", exc_info=True)
         websocket_manager.disconnect(websocket)
 
-async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_frames: int, max_duration_seconds: Optional[float] = None):
-    """流式传输视频帧，默认使用低质量压缩
+async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_frames: int, max_duration_seconds: Optional[float] = None, user_id: Optional[int] = None):
+    """流式传输视频帧，默认使用低质量压缩（支持多用户并发）
     
     Args:
         websocket: WebSocket连接
@@ -2846,17 +2960,28 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
         fps: 帧率
         max_frames: 最大帧数限制
         max_duration_seconds: 最大传输时长（秒），None表示不限制时间
+        user_id: 用户ID，用于获取对应的MCAP读取器
     """
-    global mcap_reader
+    global mcap_readers
     
-    logger.info(f"开始流式传输函数 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒")
+    logger.info(f"开始流式传输函数 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒, User ID: {user_id}")
     # 打印图像编码配置（从encode_image_to_base64函数中获取实际配置）
     max_image_size_mb = 10  # 与encode_image_to_base64函数中的限制保持一致
     jpeg_quality = 50  # 与encode_image_to_base64函数中的质量保持一致
     logger.info(f"使用默认低质量压缩 (JPEG质量: {jpeg_quality}, 最大图像大小: {max_image_size_mb}MB)")
     
+    # 根据user_id获取对应的MCAP读取器
+    mcap_reader = None
+    if user_id is not None:
+        mcap_reader = mcap_readers.get(user_id)
+    else:
+        # 如果未提供user_id，尝试从WebSocket映射中获取
+        if websocket in websocket_manager.websocket_users:
+            user_id = websocket_manager.websocket_users[websocket]
+            mcap_reader = mcap_readers.get(user_id)
+    
     if mcap_reader is None:
-        error_msg = "MCAP文件未加载，请先调用 /datafile/load_mcap 接口加载MCAP文件"
+        error_msg = f"MCAP文件未加载（用户ID: {user_id}），请先调用 /datafile/load_mcap 接口加载MCAP文件"
         logger.error(error_msg)
         try:
             await websocket_manager.send_personal_message(json.dumps({
@@ -2867,7 +2992,7 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
             pass  # 如果发送失败，可能是连接已断开
         return
     
-    logger.info(f"MCAP文件路径: {mcap_reader.mcap_path}")
+    logger.info(f"MCAP文件路径: {mcap_reader.mcap_path} (用户ID: {user_id})")
     logger.info(f"可用的video_topics: {mcap_reader.video_topics}")
     
     if topic not in mcap_reader.video_topics:
