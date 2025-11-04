@@ -2164,18 +2164,41 @@ async def download_file_by_task(
     
     logger.info(f"[Download ZIP] 开始下载（本地文件） | task_id={download_task_id} file={zip_filename} size={file_size}")
     
+    # 判断是否为临时文件（需要删除）
+    is_temp_file = file_path and (
+        file_path.startswith(TMP_DOWNLOAD_DIR) or 
+        file_path.startswith("/tmp/data_collection")
+    )
+    
     # 使用异步文件读取，尽快产出首块字节，浏览器会立即显示下载进度
     # 使用较小的 chunk size 以便更快地发送第一个数据包
     async def iter_file():
-        """异步迭代文件内容，尽快返回第一个字节"""
+        """异步迭代文件内容，尽快返回第一个字节，下载完成后删除临时文件"""
         chunk_size = 512 * 1024  # 512KB chunks - 平衡性能和首字节速度
         
-        async with aiofiles.open(file_path, 'rb') as f:
-            while True:
-                chunk = await f.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
+        try:
+            async with aiofiles.open(file_path, 'rb') as f:
+                while True:
+                    chunk = await f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            # 下载完成后删除临时文件
+            if is_temp_file and file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.info(f"[Download ZIP] 已删除临时文件 | task_id={download_task_id} file={file_path}")
+                except Exception as e:
+                    logger.error(f"[Download ZIP] 删除临时文件失败 | task_id={download_task_id} file={file_path} error={e}")
+            
+            # 清理任务记录
+            try:
+                download_tasks.pop(download_task_id, None)
+                download_file_paths.pop(download_task_id, None)
+                logger.info(f"[Download ZIP] 已清理任务记录 | task_id={download_task_id}")
+            except Exception as e:
+                logger.error(f"[Download ZIP] 清理任务记录失败 | task_id={download_task_id} error={e}")
     
     # 设置响应头，确保浏览器能够立即开始下载并显示进度
     headers = {
@@ -2962,7 +2985,7 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
         max_duration_seconds: 最大传输时长（秒），None表示不限制时间
         user_id: 用户ID，用于获取对应的MCAP读取器
     """
-    global mcap_readers
+    global mcap_readers, mcap_temp_files
     
     logger.info(f"开始流式传输函数 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒, User ID: {user_id}")
     # 打印图像编码配置（从encode_image_to_base64函数中获取实际配置）
@@ -3006,6 +3029,18 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
         except:
             pass  # 如果发送失败，可能是连接已断开
         return
+    
+    # 判断是否为从S3下载的临时文件，需要在处理完成后删除
+    temp_mcap_file = None
+    is_temp_file = False
+    if user_id is not None and user_id in mcap_temp_files:
+        temp_mcap_file = mcap_temp_files[user_id]
+        # 检查文件路径是否匹配（可能是从S3下载的临时文件）
+        if temp_mcap_file and os.path.exists(temp_mcap_file):
+            # 判断是否为临时目录下的文件（从S3下载的文件）
+            if temp_mcap_file.startswith("/tmp/") or temp_mcap_file.startswith(TMP_DOWNLOAD_DIR):
+                is_temp_file = True
+                logger.info(f"检测到临时MCAP文件，流传输完成后将删除: {temp_mcap_file}")
     
     try:
         frame_count = 0
@@ -3139,10 +3174,29 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
             }), websocket)
         except Exception:
             pass
-        return
+        raise  # 重新抛出异常，让调用者知道任务被取消
     except Exception as e:
         logger.exception(f"流式传输失败: {e}")
-        await websocket_manager.send_personal_message(json.dumps({
-            "type": "error",
-            "message": f"流式传输失败: {str(e)}"
-        }), websocket)
+        try:
+            await websocket_manager.send_personal_message(json.dumps({
+                "type": "error",
+                "message": f"流式传输失败: {str(e)}"
+            }), websocket)
+        except Exception:
+            pass
+    finally:
+        # 流传输完成后删除临时MCAP文件
+        if is_temp_file and temp_mcap_file and os.path.exists(temp_mcap_file):
+            try:
+                os.remove(temp_mcap_file)
+                logger.info(f"[Stream Video] 已删除临时MCAP文件 | user_id={user_id} file={temp_mcap_file}")
+            except Exception as e:
+                logger.error(f"[Stream Video] 删除临时MCAP文件失败 | user_id={user_id} file={temp_mcap_file} error={e}")
+        
+        # 清理临时文件记录
+        if user_id is not None and user_id in mcap_temp_files:
+            try:
+                mcap_temp_files.pop(user_id, None)
+                logger.info(f"[Stream Video] 已清理临时文件记录 | user_id={user_id}")
+            except Exception as e:
+                logger.error(f"[Stream Video] 清理临时文件记录失败 | user_id={user_id} error={e}")

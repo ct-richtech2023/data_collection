@@ -18,3 +18,5 @@ PyYAML
 passlib==1.7.4
 bcrypt==4.3.0
 aiofiles==25.1.0
+# sudo dnf install -y mesa-libGL
+# pip install "uvicorn[standard]"
