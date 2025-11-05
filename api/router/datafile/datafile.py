@@ -402,6 +402,33 @@ async def upload_mcap(
     )
 
 
+def _deserialize_datetime_from_redis(obj):
+    """递归地将字典中的所有 ISO 格式字符串转换为 datetime 对象"""
+    if isinstance(obj, str):
+        # 尝试解析为 datetime（检查是否包含日期时间格式）
+        if len(obj) > 10 and ('T' in obj or ' ' in obj):
+            try:
+                return datetime.fromisoformat(obj)
+            except (ValueError, TypeError):
+                return obj
+        return obj
+    elif isinstance(obj, dict):
+        result = {}
+        for key, value in obj.items():
+            # 如果键名包含 time 或 date，尝试解析为 datetime
+            if isinstance(value, str) and ('time' in key.lower() or 'date' in key.lower()):
+                try:
+                    result[key] = datetime.fromisoformat(value)
+                except (ValueError, TypeError):
+                    result[key] = value
+            else:
+                result[key] = _deserialize_datetime_from_redis(value)
+        return result
+    elif isinstance(obj, list):
+        return [_deserialize_datetime_from_redis(item) for item in obj]
+    else:
+        return obj
+
 def _get_upload_progress(upload_task_id: str) -> Optional[schemas.UploadProgress]:
     """获取上传进度（支持 Redis 和内存字典）"""
     if redis_store:
@@ -411,22 +438,30 @@ def _get_upload_progress(upload_task_id: str) -> Optional[schemas.UploadProgress
         if data:
             # 将字典转换为 UploadProgress 对象
             if isinstance(data, dict):
-                # 将 ISO 格式的 datetime 字符串转换回 datetime 对象
-                if 'start_time' in data and isinstance(data['start_time'], str):
-                    try:
-                        data['start_time'] = datetime.fromisoformat(data['start_time'])
-                    except (ValueError, TypeError):
-                        pass
-                if 'update_time' in data and isinstance(data['update_time'], str):
-                    try:
-                        data['update_time'] = datetime.fromisoformat(data['update_time'])
-                    except (ValueError, TypeError):
-                        pass
+                # 递归转换所有 datetime 字符串为 datetime 对象
+                data = _deserialize_datetime_from_redis(data)
                 return schemas.UploadProgress(**data)
         return None
     else:
         # 回退到内存字典
         return upload_tasks_fallback.get(upload_task_id)
+
+def _serialize_datetime_for_redis(obj):
+    """递归地将字典中的所有 datetime 对象转换为 ISO 格式字符串"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {key: _serialize_datetime_for_redis(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_serialize_datetime_for_redis(item) for item in obj]
+    elif hasattr(obj, 'model_dump'):
+        # Pydantic 模型，转换为字典后递归处理
+        return _serialize_datetime_for_redis(obj.model_dump())
+    elif hasattr(obj, 'dict'):
+        # Pydantic 模型（旧版本），转换为字典后递归处理
+        return _serialize_datetime_for_redis(obj.dict())
+    else:
+        return obj
 
 def _set_upload_progress(upload_task_id: str, progress: schemas.UploadProgress):
     """设置上传进度（支持 Redis 和内存字典）"""
@@ -435,11 +470,8 @@ def _set_upload_progress(upload_task_id: str, progress: schemas.UploadProgress):
         key = f"upload_task:{upload_task_id}"
         # 将 Pydantic 模型转换为字典
         progress_dict = progress.model_dump() if hasattr(progress, 'model_dump') else progress.dict()
-        # 转换 datetime 对象为字符串
-        if 'start_time' in progress_dict and isinstance(progress_dict['start_time'], datetime):
-            progress_dict['start_time'] = progress_dict['start_time'].isoformat()
-        if 'update_time' in progress_dict and isinstance(progress_dict['update_time'], datetime):
-            progress_dict['update_time'] = progress_dict['update_time'].isoformat()
+        # 递归转换所有 datetime 对象为字符串
+        progress_dict = _serialize_datetime_for_redis(progress_dict)
         # 设置过期时间（24小时）
         redis_store.set(key, progress_dict, expire_seconds=24*3600)
     else:
@@ -470,17 +502,8 @@ def _get_download_progress(download_task_id: str) -> Optional[schemas.DownloadPr
         if data:
             # 将字典转换为 DownloadProgress 对象
             if isinstance(data, dict):
-                # 将 ISO 格式的 datetime 字符串转换回 datetime 对象
-                if 'start_time' in data and isinstance(data['start_time'], str):
-                    try:
-                        data['start_time'] = datetime.fromisoformat(data['start_time'])
-                    except (ValueError, TypeError):
-                        pass
-                if 'update_time' in data and isinstance(data['update_time'], str):
-                    try:
-                        data['update_time'] = datetime.fromisoformat(data['update_time'])
-                    except (ValueError, TypeError):
-                        pass
+                # 递归转换所有 datetime 字符串为 datetime 对象
+                data = _deserialize_datetime_from_redis(data)
                 return schemas.DownloadProgress(**data)
         return None
     else:
@@ -494,11 +517,8 @@ def _set_download_progress(download_task_id: str, progress: schemas.DownloadProg
         key = f"download_task:{download_task_id}"
         # 将 Pydantic 模型转换为字典
         progress_dict = progress.model_dump() if hasattr(progress, 'model_dump') else progress.dict()
-        # 转换 datetime 对象为字符串
-        if 'start_time' in progress_dict and isinstance(progress_dict['start_time'], datetime):
-            progress_dict['start_time'] = progress_dict['start_time'].isoformat()
-        if 'update_time' in progress_dict and isinstance(progress_dict['update_time'], datetime):
-            progress_dict['update_time'] = progress_dict['update_time'].isoformat()
+        # 递归转换所有 datetime 对象为字符串
+        progress_dict = _serialize_datetime_for_redis(progress_dict)
         # 设置过期时间（24小时）
         redis_store.set(key, progress_dict, expire_seconds=24*3600)
     else:
