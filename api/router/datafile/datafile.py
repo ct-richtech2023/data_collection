@@ -3161,11 +3161,59 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
     mcap_reader = None
     if user_id is not None:
         mcap_reader = mcap_readers.get(user_id)
+        
+        # 如果读取器不存在，尝试从 Redis 获取文件路径并创建读取器（多 worker 支持）
+        if mcap_reader is None:
+            temp_file_path = _get_mcap_temp_file(user_id)
+            if temp_file_path and os.path.exists(temp_file_path):
+                logger.info(f"[WebSocket] 自动创建 MCAP 读取器 | user_id={user_id} file={temp_file_path} worker_pid={os.getpid()}")
+                try:
+                    mcap_reader = McapReader(temp_file_path)
+                    mcap_readers[user_id] = mcap_reader
+                    logger.info(f"[WebSocket] MCAP 读取器创建成功 | user_id={user_id}")
+                except Exception as e:
+                    logger.error(f"[WebSocket] 创建 MCAP 读取器失败 | user_id={user_id} file={temp_file_path} error={e}")
+                    error_msg = f"无法加载 MCAP 文件: {str(e)}"
+                    try:
+                        await websocket_manager.send_personal_message(json.dumps({
+                            "type": "error",
+                            "message": error_msg
+                        }), websocket)
+                    except:
+                        pass
+                    return
+            else:
+                # 文件路径不存在或文件不存在，需要先调用 load_mcap
+                if temp_file_path:
+                    logger.warning(f"[WebSocket] MCAP 文件路径存在但文件不存在 | user_id={user_id} file={temp_file_path}")
+                else:
+                    logger.warning(f"[WebSocket] MCAP 文件路径未找到 | user_id={user_id}")
     else:
         # 如果未提供user_id，尝试从WebSocket映射中获取
         if websocket in websocket_manager.websocket_users:
             user_id = websocket_manager.websocket_users[websocket]
             mcap_reader = mcap_readers.get(user_id)
+            
+            # 如果读取器不存在，尝试从 Redis 获取文件路径并创建读取器
+            if mcap_reader is None and user_id is not None:
+                temp_file_path = _get_mcap_temp_file(user_id)
+                if temp_file_path and os.path.exists(temp_file_path):
+                    logger.info(f"[WebSocket] 自动创建 MCAP 读取器 | user_id={user_id} file={temp_file_path} worker_pid={os.getpid()}")
+                    try:
+                        mcap_reader = McapReader(temp_file_path)
+                        mcap_readers[user_id] = mcap_reader
+                        logger.info(f"[WebSocket] MCAP 读取器创建成功 | user_id={user_id}")
+                    except Exception as e:
+                        logger.error(f"[WebSocket] 创建 MCAP 读取器失败 | user_id={user_id} file={temp_file_path} error={e}")
+                        error_msg = f"无法加载 MCAP 文件: {str(e)}"
+                        try:
+                            await websocket_manager.send_personal_message(json.dumps({
+                                "type": "error",
+                                "message": error_msg
+                            }), websocket)
+                        except:
+                            pass
+                        return
     
     if mcap_reader is None:
         error_msg = f"MCAP文件未加载（用户ID: {user_id}），请先调用 /datafile/load_mcap 接口加载MCAP文件"
