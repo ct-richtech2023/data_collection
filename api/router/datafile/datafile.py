@@ -32,6 +32,7 @@ from loguru import logger
 from pathlib import Path
 from common.analyze import McapReader
 from mcap_protobuf.decoder import DecoderFactory
+from common.redis_store import get_redis_store
 
 router = APIRouter()
 
@@ -45,22 +46,29 @@ TMP_DOWNLOAD_DIR = "/tmp/data_collection"
 if not os.path.exists(TMP_DOWNLOAD_DIR):
     os.makedirs(TMP_DOWNLOAD_DIR, exist_ok=True)
 
-# 上传任务状态存储（内存字典，key: upload_task_id, value: UploadProgress）
-# 格式: {upload_task_id: UploadProgress}
-upload_tasks: dict = {}
+# Redis 存储实例（用于多 worker 共享状态）
+try:
+    redis_store = get_redis_store()
+    logger.info("Redis 存储已初始化，支持多 worker 共享状态")
+except Exception as e:
+    logger.warning(f"Redis 初始化失败，将使用内存存储（仅单 worker 模式）: {e}")
+    redis_store = None
 
-# 下载任务状态存储（内存字典，key: download_task_id, value: DownloadProgress）
-# 格式: {download_task_id: DownloadProgress}
-download_tasks: dict = {}
+# 上传任务状态存储（使用 Redis，key: upload_task:{upload_task_id}）
+# 如果 Redis 不可用，回退到内存字典（仅单 worker 模式）
+upload_tasks_fallback: dict = {}  # 仅当 Redis 不可用时使用
 
-# 下载文件路径存储（用于下载后清理，key: download_task_id, value: zip_file_path）
-# 格式: {download_task_id: zip_file_path}
-download_file_paths: dict = {}
+# 下载任务状态存储（使用 Redis，key: download_task:{download_task_id}）
+download_tasks_fallback: dict = {}  # 仅当 Redis 不可用时使用
+
+# 下载文件路径存储（使用 Redis，key: download_file_path:{download_task_id}）
+download_file_paths_fallback: dict = {}  # 仅当 Redis 不可用时使用
 
 # MCAP 查看器存储（支持多用户并发）
+# 注意：mcap_readers 对象仍然存储在内存中（每个 worker 独立），但文件路径存储在 Redis
 # 格式: {user_id: McapReader} 或 {websocket_id: McapReader}
-mcap_readers: Dict[Union[int, str], McapReader] = {}  # MCAP读取器实例存储
-mcap_temp_files: Dict[Union[int, str], str] = {}  # S3下载的临时MCAP文件路径存储
+mcap_readers: Dict[Union[int, str], McapReader] = {}  # MCAP读取器实例存储（内存，每个 worker 独立）
+# mcap_temp_files 文件路径存储在 Redis（key: mcap_temp_file:{user_id}）
 
 # WebSocket连接管理
 class ConnectionManager:
@@ -344,8 +352,8 @@ async def upload_mcap(
         update_time=datetime.now()
     )
     
-    # 存储到内存字典
-    upload_tasks[upload_task_id] = progress
+    # 存储到 Redis 或内存字典
+    _set_upload_progress(upload_task_id, progress)
     
     # 保存用户信息用于后台任务（不能直接传递用户对象，需要传递ID和用户名）
     user_id = current_user.id
@@ -378,7 +386,10 @@ async def upload_mcap(
         )
     else:
         # 清理任务状态
-        upload_tasks.pop(upload_task_id, None)
+        if redis_store:
+            redis_store.delete(f"upload_task:{upload_task_id}")
+        else:
+            upload_tasks_fallback.pop(upload_task_id, None)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="不支持的文件类型"
@@ -391,26 +402,175 @@ async def upload_mcap(
     )
 
 
+def _get_upload_progress(upload_task_id: str) -> Optional[schemas.UploadProgress]:
+    """获取上传进度（支持 Redis 和内存字典）"""
+    if redis_store:
+        # 使用 Redis
+        key = f"upload_task:{upload_task_id}"
+        data = redis_store.get(key)
+        if data:
+            # 将字典转换为 UploadProgress 对象
+            if isinstance(data, dict):
+                # 将 ISO 格式的 datetime 字符串转换回 datetime 对象
+                if 'start_time' in data and isinstance(data['start_time'], str):
+                    try:
+                        data['start_time'] = datetime.fromisoformat(data['start_time'])
+                    except (ValueError, TypeError):
+                        pass
+                if 'update_time' in data and isinstance(data['update_time'], str):
+                    try:
+                        data['update_time'] = datetime.fromisoformat(data['update_time'])
+                    except (ValueError, TypeError):
+                        pass
+                return schemas.UploadProgress(**data)
+        return None
+    else:
+        # 回退到内存字典
+        return upload_tasks_fallback.get(upload_task_id)
+
+def _set_upload_progress(upload_task_id: str, progress: schemas.UploadProgress):
+    """设置上传进度（支持 Redis 和内存字典）"""
+    if redis_store:
+        # 使用 Redis
+        key = f"upload_task:{upload_task_id}"
+        # 将 Pydantic 模型转换为字典
+        progress_dict = progress.model_dump() if hasattr(progress, 'model_dump') else progress.dict()
+        # 转换 datetime 对象为字符串
+        if 'start_time' in progress_dict and isinstance(progress_dict['start_time'], datetime):
+            progress_dict['start_time'] = progress_dict['start_time'].isoformat()
+        if 'update_time' in progress_dict and isinstance(progress_dict['update_time'], datetime):
+            progress_dict['update_time'] = progress_dict['update_time'].isoformat()
+        # 设置过期时间（24小时）
+        redis_store.set(key, progress_dict, expire_seconds=24*3600)
+    else:
+        # 回退到内存字典
+        upload_tasks_fallback[upload_task_id] = progress
+
 def _update_progress(upload_task_id: str, **kwargs):
     """更新上传进度"""
-    if upload_task_id in upload_tasks:
-        progress = upload_tasks[upload_task_id]
+    progress = _get_upload_progress(upload_task_id)
+    if progress:
+        # 更新字段
         for key, value in kwargs.items():
             if hasattr(progress, key):
                 setattr(progress, key, value)
         progress.update_time = datetime.now()
-        upload_tasks[upload_task_id] = progress
+        _set_upload_progress(upload_task_id, progress)
+    else:
+        # 如果任务不存在，创建新任务（这种情况不应该发生，但为了兼容性保留）
+        logger.warning(f"尝试更新不存在的上传任务: {upload_task_id}")
 
+
+def _get_download_progress(download_task_id: str) -> Optional[schemas.DownloadProgress]:
+    """获取下载进度（支持 Redis 和内存字典）"""
+    if redis_store:
+        # 使用 Redis
+        key = f"download_task:{download_task_id}"
+        data = redis_store.get(key)
+        if data:
+            # 将字典转换为 DownloadProgress 对象
+            if isinstance(data, dict):
+                # 将 ISO 格式的 datetime 字符串转换回 datetime 对象
+                if 'start_time' in data and isinstance(data['start_time'], str):
+                    try:
+                        data['start_time'] = datetime.fromisoformat(data['start_time'])
+                    except (ValueError, TypeError):
+                        pass
+                if 'update_time' in data and isinstance(data['update_time'], str):
+                    try:
+                        data['update_time'] = datetime.fromisoformat(data['update_time'])
+                    except (ValueError, TypeError):
+                        pass
+                return schemas.DownloadProgress(**data)
+        return None
+    else:
+        # 回退到内存字典
+        return download_tasks_fallback.get(download_task_id)
+
+def _set_download_progress(download_task_id: str, progress: schemas.DownloadProgress):
+    """设置下载进度（支持 Redis 和内存字典）"""
+    if redis_store:
+        # 使用 Redis
+        key = f"download_task:{download_task_id}"
+        # 将 Pydantic 模型转换为字典
+        progress_dict = progress.model_dump() if hasattr(progress, 'model_dump') else progress.dict()
+        # 转换 datetime 对象为字符串
+        if 'start_time' in progress_dict and isinstance(progress_dict['start_time'], datetime):
+            progress_dict['start_time'] = progress_dict['start_time'].isoformat()
+        if 'update_time' in progress_dict and isinstance(progress_dict['update_time'], datetime):
+            progress_dict['update_time'] = progress_dict['update_time'].isoformat()
+        # 设置过期时间（24小时）
+        redis_store.set(key, progress_dict, expire_seconds=24*3600)
+    else:
+        # 回退到内存字典
+        download_tasks_fallback[download_task_id] = progress
 
 def _update_download_progress(download_task_id: str, **kwargs):
     """更新下载进度"""
-    if download_task_id in download_tasks:
-        progress = download_tasks[download_task_id]
+    progress = _get_download_progress(download_task_id)
+    if progress:
+        # 更新字段
         for key, value in kwargs.items():
             if hasattr(progress, key):
                 setattr(progress, key, value)
         progress.update_time = datetime.now()
-        download_tasks[download_task_id] = progress
+        _set_download_progress(download_task_id, progress)
+    else:
+        # 如果任务不存在，创建新任务（这种情况不应该发生，但为了兼容性保留）
+        logger.warning(f"尝试更新不存在的下载任务: {download_task_id}")
+
+def _get_download_file_path(download_task_id: str) -> Optional[str]:
+    """获取下载文件路径（支持 Redis 和内存字典）"""
+    if redis_store:
+        key = f"download_file_path:{download_task_id}"
+        return redis_store.get(key)
+    else:
+        return download_file_paths_fallback.get(download_task_id)
+
+def _set_download_file_path(download_task_id: str, file_path: str):
+    """设置下载文件路径（支持 Redis 和内存字典）"""
+    if redis_store:
+        key = f"download_file_path:{download_task_id}"
+        redis_store.set(key, file_path, expire_seconds=24*3600)
+    else:
+        download_file_paths_fallback[download_task_id] = file_path
+
+def _delete_download_file_path(download_task_id: str):
+    """删除下载文件路径（支持 Redis 和内存字典）"""
+    if redis_store:
+        key = f"download_file_path:{download_task_id}"
+        redis_store.delete(key)
+    else:
+        download_file_paths_fallback.pop(download_task_id, None)
+
+def _get_mcap_temp_file(user_id: Union[int, str]) -> Optional[str]:
+    """获取 MCAP 临时文件路径（支持 Redis 和内存字典）"""
+    if redis_store:
+        key = f"mcap_temp_file:{user_id}"
+        return redis_store.get(key)
+    else:
+        # 回退到内存字典（仅单 worker 模式）
+        # 注意：mcap_temp_files 已经被移除，这里需要创建一个回退字典
+        if not hasattr(_get_mcap_temp_file, '_fallback_dict'):
+            _get_mcap_temp_file._fallback_dict = {}
+        return _get_mcap_temp_file._fallback_dict.get(user_id)
+
+def _set_mcap_temp_file(user_id: Union[int, str], file_path: Optional[str]):
+    """设置 MCAP 临时文件路径（支持 Redis 和内存字典）"""
+    if redis_store:
+        key = f"mcap_temp_file:{user_id}"
+        if file_path:
+            redis_store.set(key, file_path, expire_seconds=3600)  # 1小时过期
+        else:
+            redis_store.delete(key)
+    else:
+        # 回退到内存字典（仅单 worker 模式）
+        if not hasattr(_set_mcap_temp_file, '_fallback_dict'):
+            _set_mcap_temp_file._fallback_dict = {}
+        if file_path:
+            _set_mcap_temp_file._fallback_dict[user_id] = file_path
+        else:
+            _set_mcap_temp_file._fallback_dict.pop(user_id, None)
 
 
 def _process_single_mcap_with_progress_background(
@@ -872,7 +1032,7 @@ def _process_zip_file_with_progress_background(
                     
                     # 更新进度：文件处理成功
                     completed_file_data = schemas.DataFileOut.model_validate(db_datafile)
-                    current_progress = upload_tasks.get(upload_task_id)
+                    current_progress = _get_upload_progress(upload_task_id)
                     if current_progress:
                         completed_list = list(current_progress.completed_files) if current_progress.completed_files else []
                         completed_list.append(completed_file_data)
@@ -889,7 +1049,7 @@ def _process_zip_file_with_progress_background(
                     logger.exception(f"[Upload ZIP] 处理MCAP文件失败: {mcap_filename}, 错误: {e}")
                     # 更新失败文件列表
                     failed_name = os.path.basename(mcap_filename)
-                    current_progress = upload_tasks.get(upload_task_id)
+                    current_progress = _get_upload_progress(upload_task_id)
                     if current_progress:
                         failed_list = list(current_progress.failed_files) if current_progress.failed_files else []
                         failed_list.append(failed_name)
@@ -918,7 +1078,7 @@ def _process_zip_file_with_progress_background(
                 # 注意：后台任务中不能抛出HTTPException，因为响应已发送，只需更新进度状态
                 return
             else:
-                current_progress = upload_tasks.get(upload_task_id)
+                current_progress = _get_upload_progress(upload_task_id)
                 if current_progress and current_progress.failed_files:
                     message = f"上传完成: 成功 {len(created_files)}/{len(mcap_files)} 个文件，失败 {len(current_progress.failed_files)} 个"
                 else:
@@ -1306,7 +1466,7 @@ async def _process_zip_file_with_progress(
                     
                     # 更新进度：文件处理成功
                     completed_file_data = schemas.DataFileOut.model_validate(db_datafile)
-                    current_progress = upload_tasks.get(upload_task_id)
+                    current_progress = _get_upload_progress(upload_task_id)
                     if current_progress:
                         completed_list = list(current_progress.completed_files) if current_progress.completed_files else []
                         completed_list.append(completed_file_data)
@@ -1323,7 +1483,7 @@ async def _process_zip_file_with_progress(
                     logger.exception(f"[Upload ZIP] 处理MCAP文件失败: {mcap_filename}, 错误: {e}")
                     # 更新失败文件列表
                     failed_name = os.path.basename(mcap_filename)
-                    current_progress = upload_tasks.get(upload_task_id)
+                    current_progress = _get_upload_progress(upload_task_id)
                     if current_progress:
                         failed_list = list(current_progress.failed_files) if current_progress.failed_files else []
                         failed_list.append(failed_name)
@@ -1352,7 +1512,7 @@ async def _process_zip_file_with_progress(
                 # 注意：后台任务中不能抛出HTTPException，因为响应已发送，只需更新进度状态
                 return
             else:
-                current_progress = upload_tasks.get(upload_task_id)
+                current_progress = _get_upload_progress(upload_task_id)
                 if current_progress and current_progress.failed_files:
                     message = f"上传完成: 成功 {len(created_files)}/{len(mcap_files)} 个文件，失败 {len(current_progress.failed_files)} 个"
                 else:
@@ -1409,13 +1569,13 @@ def get_upload_status(
     current_user = get_current_user(token, db)
     
     # 检查任务是否存在
-    if upload_task_id not in upload_tasks:
+    progress = _get_upload_progress(upload_task_id)
+    if not progress:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="上传任务不存在或已过期"
         )
     
-    progress = upload_tasks[upload_task_id]
     return progress
 
 
@@ -1816,7 +1976,7 @@ def download_files_zip(
     )
     
     # 存储到内存字典
-    download_tasks[download_task_id] = progress
+    _set_download_progress(download_task_id, progress)
     
     # 保存用户和文件信息用于后台任务
     user_id = current_user.id
@@ -2044,7 +2204,7 @@ def _process_download_zip_background(
         temp_download_url = f"/tmp/data_collection/{zip_filename}"
         
         # 保存文件路径，用于下载后清理
-        download_file_paths[download_task_id] = temp_zip_path
+        _set_download_file_path(download_task_id, temp_zip_path)
         
         # 创建文件下载操作日志
         from common.operation_log_util import OperationLogUtil
@@ -2088,13 +2248,13 @@ def get_download_status(
     current_user = get_current_user(token, db)
     
     # 检查任务是否存在
-    if download_task_id not in download_tasks:
+    progress = _get_download_progress(download_task_id)
+    if not progress:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="下载任务不存在或已过期"
         )
     
-    progress = download_tasks[download_task_id]
     return progress
 
 
@@ -2109,13 +2269,12 @@ async def download_file_by_task(
     current_user = get_current_user(token, db)
     
     # 检查任务是否存在
-    if download_task_id not in download_tasks:
+    progress = _get_download_progress(download_task_id)
+    if not progress:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="下载任务不存在或已过期"
         )
-    
-    progress = download_tasks[download_task_id]
     
     # 检查任务是否已完成
     if progress.status != "completed":
@@ -2132,10 +2291,8 @@ async def download_file_by_task(
         )
     
     # 获取文件路径
-    file_path = None
-    if download_task_id in download_file_paths:
-        file_path = download_file_paths[download_task_id]
-    else:
+    file_path = _get_download_file_path(download_task_id)
+    if not file_path:
         # 从download_url解析文件路径
         if progress.download_url:
             if progress.download_url.startswith("/tmp/data_collection/"):
@@ -2149,8 +2306,12 @@ async def download_file_by_task(
     
     if not file_path or not os.path.exists(file_path):
         # 清理无效的任务记录
-        download_tasks.pop(download_task_id, None)
-        download_file_paths.pop(download_task_id, None)
+        if redis_store:
+            redis_store.delete(f"download_task:{download_task_id}")
+            _delete_download_file_path(download_task_id)
+        else:
+            download_tasks_fallback.pop(download_task_id, None)
+            _delete_download_file_path(download_task_id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="下载文件不存在或已过期"
@@ -2194,8 +2355,11 @@ async def download_file_by_task(
             
             # 清理任务记录
             try:
-                download_tasks.pop(download_task_id, None)
-                download_file_paths.pop(download_task_id, None)
+                if redis_store:
+                    redis_store.delete(f"download_task:{download_task_id}")
+                else:
+                    download_tasks_fallback.pop(download_task_id, None)
+                _delete_download_file_path(download_task_id)
                 logger.info(f"[Download ZIP] 已清理任务记录 | task_id={download_task_id}")
             except Exception as e:
                 logger.error(f"[Download ZIP] 清理任务记录失败 | task_id={download_task_id} error={e}")
@@ -2521,14 +2685,13 @@ async def download_mcap_from_s3_for_user(s3_url: str, user_id: int) -> str:
         logger.info(f"S3下载完成 | path={temp_path} size={actual_size / (1024*1024):.2f} MB user_id={user_id}")
         
         # 清理该用户之前的临时文件（如果有）
-        if user_id in mcap_temp_files:
-            old_temp_file = mcap_temp_files[user_id]
-            if old_temp_file and os.path.exists(old_temp_file) and old_temp_file != temp_path:
-                try:
-                    os.remove(old_temp_file)
-                    logger.info(f"已清理用户 {user_id} 的旧临时文件: {old_temp_file}")
-                except Exception as e:
-                    logger.info(f"清理旧临时文件失败: {e}")
+        old_temp_file = _get_mcap_temp_file(user_id)
+        if old_temp_file and os.path.exists(old_temp_file) and old_temp_file != temp_path:
+            try:
+                os.remove(old_temp_file)
+                logger.info(f"已清理用户 {user_id} 的旧临时文件: {old_temp_file}")
+            except Exception as e:
+                logger.info(f"清理旧临时文件失败: {e}")
         
         return temp_path
         
@@ -2600,14 +2763,13 @@ async def load_mcap(
             del mcap_readers[user_id]
         
         # 清理该用户之前的临时文件
-        if user_id in mcap_temp_files:
-            old_temp_file = mcap_temp_files[user_id]
-            if old_temp_file and os.path.exists(old_temp_file) and old_temp_file != file_path_or_s3_url:
-                try:
-                    os.remove(old_temp_file)
-                    logger.info(f"已清理用户 {user_id} 的旧临时文件: {old_temp_file}")
-                except Exception:
-                    pass
+        old_temp_file = _get_mcap_temp_file(user_id)
+        if old_temp_file and os.path.exists(old_temp_file) and old_temp_file != file_path_or_s3_url:
+            try:
+                os.remove(old_temp_file)
+                logger.info(f"已清理用户 {user_id} 的旧临时文件: {old_temp_file}")
+            except Exception:
+                pass
         
         local_file_path = None
         is_s3_source = False
@@ -2652,10 +2814,10 @@ async def load_mcap(
         # 基于user_id存储读取器和临时文件路径
         mcap_readers[user_id] = mcap_reader
         if is_s3_source:
-            mcap_temp_files[user_id] = local_file_path
+            _set_mcap_temp_file(user_id, local_file_path)
         else:
             # 本地文件不需要存储临时路径
-            mcap_temp_files.pop(user_id, None)
+            _set_mcap_temp_file(user_id, None)
         
         return {
             "success": True,
@@ -3033,8 +3195,8 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
     # 判断是否为从S3下载的临时文件，需要在处理完成后删除
     temp_mcap_file = None
     is_temp_file = False
-    if user_id is not None and user_id in mcap_temp_files:
-        temp_mcap_file = mcap_temp_files[user_id]
+    if user_id is not None:
+        temp_mcap_file = _get_mcap_temp_file(user_id)
         # 检查文件路径是否匹配（可能是从S3下载的临时文件）
         if temp_mcap_file and os.path.exists(temp_mcap_file):
             # 判断是否为临时目录下的文件（从S3下载的文件）
