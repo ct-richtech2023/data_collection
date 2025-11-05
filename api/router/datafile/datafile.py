@@ -1975,8 +1975,9 @@ def download_files_zip(
         update_time=datetime.now()
     )
     
-    # 存储到内存字典
+    # 存储到 Redis 或内存字典
     _set_download_progress(download_task_id, progress)
+    logger.info(f"[Download ZIP] 任务已创建 | download_task_id={download_task_id} redis_store={'可用' if redis_store else '不可用（使用内存存储）'}")
     
     # 保存用户和文件信息用于后台任务
     user_id = current_user.id
@@ -2248,13 +2249,16 @@ def get_download_status(
     current_user = get_current_user(token, db)
     
     # 检查任务是否存在
+    logger.info(f"[Download Status] 查询任务 | download_task_id={download_task_id} redis_store={'可用' if redis_store else '不可用（使用内存存储）'}")
     progress = _get_download_progress(download_task_id)
     if not progress:
+        logger.warning(f"[Download Status] 任务不存在 | download_task_id={download_task_id}")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="下载任务不存在或已过期"
         )
     
+    logger.info(f"[Download Status] 任务找到 | download_task_id={download_task_id} status={progress.status} progress={progress.progress_percent}%")
     return progress
 
 
@@ -2626,8 +2630,6 @@ async def download_mcap_from_s3_for_user(s3_url: str, user_id: int) -> str:
     Returns:
         临时文件路径
     """
-    global mcap_temp_files
-    
     try:
         bucket, key = parse_s3_url(s3_url)
         s3 = get_s3_client()
@@ -2750,7 +2752,7 @@ async def load_mcap(
     
     if not file_path_or_s3_url:
         raise HTTPException(status_code=400, detail="请提供 file_path_or_s3_url 参数")
-    global mcap_readers, mcap_temp_files
+    global mcap_readers
     
     try:
         # 关闭该用户之前打开的读取器
@@ -3147,7 +3149,7 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
         max_duration_seconds: 最大传输时长（秒），None表示不限制时间
         user_id: 用户ID，用于获取对应的MCAP读取器
     """
-    global mcap_readers, mcap_temp_files
+    global mcap_readers
     
     logger.info(f"开始流式传输函数 - Topic: {topic}, FPS: {fps}, Max Frames: {max_frames}, Max Duration: {max_duration_seconds}秒, User ID: {user_id}")
     # 打印图像编码配置（从encode_image_to_base64函数中获取实际配置）
@@ -3356,9 +3358,9 @@ async def stream_video_frames(websocket: WebSocket, topic: str, fps: int, max_fr
                 logger.error(f"[Stream Video] 删除临时MCAP文件失败 | user_id={user_id} file={temp_mcap_file} error={e}")
         
         # 清理临时文件记录
-        if user_id is not None and user_id in mcap_temp_files:
+        if user_id is not None:
             try:
-                mcap_temp_files.pop(user_id, None)
+                _set_mcap_temp_file(user_id, None)
                 logger.info(f"[Stream Video] 已清理临时文件记录 | user_id={user_id}")
             except Exception as e:
                 logger.error(f"[Stream Video] 清理临时文件记录失败 | user_id={user_id} error={e}")
