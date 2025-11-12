@@ -8,6 +8,7 @@ import sys
 import os
 import hashlib
 import secrets
+import argparse
 
 # 添加项目根目录到 Python 路径
 project_root = os.path.dirname(os.path.dirname(__file__))
@@ -17,24 +18,24 @@ from api.common.database import SessionLocal
 from api.common import models
 from api.router.user.auth import hash_password  # 统一使用应用内的哈希策略（bcrypt_sha256 优先）
 
-def create_admin_user():
+def create_admin_user(username: str, email: str, password: str):
     """创建管理员用户"""
     db = SessionLocal()
     try:
-        # 检查是否已有管理员用户
-        admin_exists = db.query(models.User).filter(
-            models.User.permission_level == models.PermissionLevel.ADMIN
-        ).first()
+        # # 检查是否已有管理员用户
+        # admin_exists = db.query(models.User).filter(
+        #     models.User.permission_level == models.PermissionLevel.ADMIN
+        # ).first()
         
-        if admin_exists:
-            print(f"管理员用户已存在: {admin_exists.username}")
-            return admin_exists
+        # if admin_exists:
+        #     print(f"管理员用户已存在: {admin_exists.username}")
+        #     return admin_exists
         
         # 创建默认管理员用户
         admin_user = models.User(
-            username="admin",
-            email="admin@example.com",
-            password=hash_password("admin123"),  # 默认密码
+            username=username,
+            email=email,
+            password=hash_password(password),  # 默认密码
             permission_level=models.PermissionLevel.ADMIN,
             extra={"description": "系统管理员账户"}
         )
@@ -46,7 +47,7 @@ def create_admin_user():
         print("✅ 管理员用户创建成功!")
         print(f"用户名: {admin_user.username}")
         print(f"邮箱: {admin_user.email}")
-        print(f"密码: admin123")
+        print(f"密码: {password}")
         print(f"权限级别: {admin_user.permission_level}")
         print("\n⚠️  请及时修改默认密码!")
         
@@ -59,18 +60,44 @@ def create_admin_user():
     finally:
         db.close()
 
+def delete_admin_user(username: str):
+    """删除管理员用户"""
+    db = SessionLocal()
+    try:
+        db.query(models.User).filter(models.User.username == username).delete()
+        db.commit()
+        print("✅ 管理员用户删除成功!")
+    except Exception as e:
+        print(f"❌ 删除管理员用户失败: {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
 if __name__ == "__main__":
-    print("==========================================")
-    print("创建初始管理员用户")
-    print("==========================================")
+    """
+    使用方法:
+    python3 create_admin_user.py create --username admin001 --email admin001@example.com --password admin123
+    python3 create_admin_user.py delete --username admin001
+    """
+    parser = argparse.ArgumentParser(description="创建或删除管理员用户")
+    subparsers = parser.add_subparsers(dest="action", help="操作类型")
     
-    user = create_admin_user()
+    # 创建用户子命令
+    create_parser = subparsers.add_parser("create", help="创建管理员用户")
+    create_parser.add_argument("--username", required=True, help="用户名")
+    create_parser.add_argument("--email", required=True, help="邮箱地址")
+    create_parser.add_argument("--password", required=True, help="密码")
     
-    if user:
-        print("\n==========================================")
-        print("管理员用户创建完成!")
-        print("现在可以使用管理员账户登录并注册其他用户")
-        print("==========================================")
+    # 删除用户子命令
+    delete_parser = subparsers.add_parser("delete", help="删除管理员用户")
+    delete_parser.add_argument("--username", required=True, help="要删除的用户名")
+    
+    args = parser.parse_args()
+    
+    if args.action == "create":
+        create_admin_user(username=args.username, email=args.email, password=args.password)
+    elif args.action == "delete":
+        delete_admin_user(username=args.username)
     else:
-        print("\n❌ 管理员用户创建失败")
-        sys.exit(1)
+        parser.print_help()
