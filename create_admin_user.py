@@ -74,11 +74,47 @@ def delete_admin_user(username: str):
     finally:
         db.close()
 
+def select_all_users():
+    """查询所有用户并打印信息"""
+    db = SessionLocal()
+    try:
+        users = db.query(models.User).all()
+        
+        if not users:
+            print("📋 当前没有用户")
+            return []
+        
+        print(f"\n📋 共找到 {len(users)} 个用户:\n")
+        print("-" * 80)
+        
+        for idx, user in enumerate(users, 1):
+            print(f"\n用户 #{idx}:")
+            print(f"  ID: {user.id}")
+            print(f"  用户名: {user.username}")
+            print(f"  邮箱: {user.email}")
+            print(f"  权限级别: {user.permission_level}")
+            if user.extra:
+                print(f"  扩展信息: {user.extra}")
+            if user.create_time:
+                print(f"  创建时间: {user.create_time}")
+            if user.update_time:
+                print(f"  更新时间: {user.update_time}")
+        
+        print("\n" + "-" * 80)
+        
+        return users
+    except Exception as e:
+        print(f"❌ 查询所有用户失败: {e}")
+        return None
+    finally:
+        db.close()
+
 if __name__ == "__main__":
     """
     使用方法:
     python3 create_admin_user.py create --username admin001 --email admin001@example.com --password admin123
     python3 create_admin_user.py delete --username admin001
+    python3 create_admin_user.py list
     """
     parser = argparse.ArgumentParser(description="创建或删除管理员用户")
     subparsers = parser.add_subparsers(dest="action", help="操作类型")
@@ -93,11 +129,16 @@ if __name__ == "__main__":
     delete_parser = subparsers.add_parser("delete", help="删除管理员用户")
     delete_parser.add_argument("--username", required=True, help="要删除的用户名")
     
+    # 列出所有用户子命令
+    list_parser = subparsers.add_parser("list", help="列出所有用户")
+    
     args = parser.parse_args()
     
     if args.action == "create":
         create_admin_user(username=args.username, email=args.email, password=args.password)
     elif args.action == "delete":
         delete_admin_user(username=args.username)
+    elif args.action == "list":
+        select_all_users()
     else:
         parser.print_help()
