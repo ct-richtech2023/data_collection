@@ -112,9 +112,9 @@ def select_all_users():
 if __name__ == "__main__":
     """
     使用方法:
-    python3 create_admin_user.py create --username admin001 --email admin001@example.com --password admin123
-    python3 create_admin_user.py delete --username admin001
-    python3 create_admin_user.py list
+    python3 user_operation.py create --username admin001 --email admin001@example.com --password admin123
+    python3 user_operation.py delete --username admin001
+    python3 user_operation.py list
     """
     parser = argparse.ArgumentParser(description="创建或删除管理员用户")
     subparsers = parser.add_subparsers(dest="action", help="操作类型")
