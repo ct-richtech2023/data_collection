@@ -563,6 +563,45 @@ def _delete_download_file_path(download_task_id: str):
     else:
         download_file_paths_fallback.pop(download_task_id, None)
 
+def _resolve_file_path_from_download_url(download_url: str) -> Optional[str]:
+    """
+    从 download_url 解析文件路径
+    支持多种路径格式的兼容性处理
+    """
+    if not download_url:
+        return None
+    
+    # 处理不同的路径格式
+    if download_url.startswith("/tmp/data_collection/"):
+        return download_url.replace("/tmp/data_collection/", TMP_DOWNLOAD_DIR + "/")
+    elif download_url.startswith("/downloads/"):
+        # 兼容旧路径
+        return download_url.replace("/downloads/", TMP_DOWNLOAD_DIR + "/")
+    elif download_url.startswith("/uploads/"):
+        # 兼容旧路径
+        return download_url.replace("/uploads/", UPLOAD_DIR + "/")
+    elif download_url.startswith(TMP_DOWNLOAD_DIR):
+        # 已经是完整路径
+        return download_url
+    elif download_url.startswith(UPLOAD_DIR):
+        # 已经是完整路径
+        return download_url
+    
+    return None
+
+def _cleanup_download_task(download_task_id: str):
+    """
+    清理下载任务记录（Redis 和内存字典）
+    """
+    try:
+        if redis_store:
+            redis_store.delete(f"download_task:{download_task_id}")
+        else:
+            download_tasks_fallback.pop(download_task_id, None)
+        _delete_download_file_path(download_task_id)
+    except Exception as e:
+        logger.warning(f"[Delete Task] 清理任务记录失败 | task_id={download_task_id} error={e}")
+
 def _get_mcap_temp_file(user_id: Union[int, str]) -> Optional[str]:
     """获取 MCAP 临时文件路径（支持 Redis 和内存字典）"""
     if redis_store:
@@ -2408,64 +2447,122 @@ async def download_file_by_task(
     )
 
 
-@router.get("/test_download")
-def test_download():
-    """测试下载功能 - 返回一个简单的文本文件"""
-    test_content = "这是一个测试文件\n测试下载功能是否正常工作\n时间: " + str(datetime.now())
+@router.post("/delete_temporary_file_by_task_id")
+def delete_temporary_file_by_task_id(
+    request: schemas.DeleteFileByTaskIdRequest,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """
+    通过下载任务ID删除临时文件，只能删除临时文件，不能删除其他文件（如ZIP文件）
     
-    # 使用内存方式返回文件
-    import io
-    
-    def generate_text():
-        yield test_content.encode('utf-8')
-    
-    return StreamingResponse(
-        generate_text(),
-        media_type='text/plain',
-        headers={"Content-Disposition": "attachment; filename=test_download.txt"}
-    )
-
-
-@router.get("/test_zip_download")
-def test_zip_download():
-    """测试ZIP下载功能 - 创建一个简单的ZIP文件"""
-    import io
-    import zipfile
-    
-    # 创建测试内容
-    test_content = "这是一个测试文件\n测试ZIP下载功能\n时间: " + str(datetime.now())
-    
-    # 创建内存中的ZIP文件
-    zip_buffer = io.BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        # 添加文本文件到ZIP
-        zipf.writestr("test_file.txt", test_content)
-        zipf.writestr("another_file.txt", "另一个测试文件\n内容很简单")
-    
-    # 获取ZIP文件大小
-    zip_size = zip_buffer.tell()
-    logger.info(f"测试ZIP文件大小: {zip_size} 字节")  # 调试信息
-    
-    # 改进的生成器函数
-    def generate_zip():
-        zip_buffer.seek(0)
-        chunk_size = 1024 * 1024  # 1MB chunks
-        while True:
-            chunk = zip_buffer.read(chunk_size)
-            if not chunk:
-                break
-            yield chunk
-    
-    return StreamingResponse(
-        generate_zip(),
-        media_type='application/zip',
-        headers={
-            "Content-Disposition": "attachment; filename=test_download.zip",
-            "Content-Length": str(zip_size),
-            "Cache-Control": "no-cache"
+    流程：
+    1. 校验用户身份
+    2. 检查下载任务是否存在
+    3. 获取文件路径（从任务记录或 download_url 解析）
+    4. 验证文件是否存在
+    5. 删除文件
+    6. 清理任务记录
+    7. 记录操作日志
+    """
+    try:
+        # 验证token并获取当前用户
+        current_user = get_current_user(token, db)
+        download_task_id = request.download_task_id
+        
+        logger.info(
+            f"[Delete Task Temporary File] 删除请求 | user_id={current_user.id} "
+            f"task_id={download_task_id}"
+        )
+        
+        # 1. 检查任务是否存在
+        progress = _get_download_progress(download_task_id)
+        if not progress:
+            logger.warning(
+                f"[Delete Task Temporary File] 任务不存在 | user_id={current_user.id} "
+                f"task_id={download_task_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="下载任务不存在或已过期"
+            )
+        
+        # 2. 获取文件路径
+        file_path = _get_download_file_path(download_task_id)
+        
+        # 如果未找到文件路径，尝试从 download_url 解析
+        if not file_path and progress.download_url:
+            file_path = _resolve_file_path_from_download_url(progress.download_url)
+        
+        # 3. 验证文件是否存在
+        if not file_path or not os.path.exists(file_path):
+            logger.warning(
+                f"[Delete Task Temporary File] 文件不存在 | user_id={current_user.id} "
+                f"task_id={download_task_id} file_path={file_path}"
+            )
+            # 清理无效的任务记录
+            _cleanup_download_task(download_task_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="下载文件不存在或已过期"
+            )
+        
+        # 4. 判断是否为临时文件（只删除临时文件，保护其他文件）
+        is_temp_file = file_path and (
+            file_path.startswith(TMP_DOWNLOAD_DIR) or 
+            file_path.startswith("/tmp/data_collection")
+        )
+        
+        if not is_temp_file:
+            logger.warning(
+                f"[Delete Task Temporary File] 非临时文件，拒绝删除 | user_id={current_user.id} "
+                f"task_id={download_task_id} file_path={file_path}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="只能删除临时文件，该文件不在临时目录中"
+            )
+        
+        # 5. 获取文件信息（用于日志）
+        zip_filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        # 6. 删除文件
+        try:
+            os.remove(file_path)
+            logger.info(
+                f"[Delete Task Temporary File] 文件删除成功 | user_id={current_user.id} "
+                f"task_id={download_task_id} file={zip_filename} size={file_size}"
+            )
+        except OSError as e:
+            logger.error(
+                f"[Delete Task Temporary File] 文件删除失败 | user_id={current_user.id} "
+                f"task_id={download_task_id} file={file_path} error={e}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"删除文件失败: {str(e)}"
+            )
+        
+        # 7. 清理任务记录
+        _cleanup_download_task(download_task_id)
+        
+        return {
+            "message": f"临时文件 {zip_filename} 已成功删除",
+            "task_id": download_task_id,
+            "file_name": zip_filename,
+            "file_size": file_size
         }
-    )
+        
+    except HTTPException:
+        # 已经构造好的 HTTPException 直接抛出
+        raise
+    except Exception as e:
+        logger.exception(f"[Delete Task Temporary File] 未知异常: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="删除文件失败，请稍后重试",
+        )
 
 
 @router.post("/get_datafiles_with_pagination")

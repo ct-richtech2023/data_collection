@@ -296,6 +296,11 @@ class DownloadResponse(StrictModel):
     message: str = Field(..., description="响应消息")
 
 
+class DeleteFileByTaskIdRequest(StrictModel):
+    """通过任务ID删除临时文件请求"""
+    download_task_id: str = Field(..., description="下载任务ID")
+
+
 class DataFileUpload(StrictModel):
     task_id: int = Field(..., description="任务ID")
     device_id: int = Field(..., description="设备ID")
@@ -444,6 +449,52 @@ class UserPermissionsCreate(StrictModel):
             }
         }
 
+
+# ---------- ZIP数据文件管理 ----------
+class ZipUploadRequest(StrictModel):
+    file_name: str
+
+
+class ZipDataFileCreate(StrictModel):
+    file_name: str
+    file_size: int
+    s3_key: str
+
+
+class ZipDataFileOut(StrictModel):
+    id: int
+    file_name: str
+    file_size: int
+    download_number: int
+    download_url: str
+    user_id: int
+    create_time: datetime
+    update_time: datetime
+
+
+class ZipDataFileQuery(StrictModel):
+    zip_datafile_id: Optional[int] = Field(default=None, description="ZIP文件ID，为空则查询所有ZIP文件")
+    file_name: Optional[str] = Field(default=None, description="文件名，支持模糊查询")
+    user_id: Optional[int] = Field(default=None, description="用户ID，为空则查询所有用户的ZIP文件")
+    page: Optional[int] = Field(default=1, ge=1, description="页码，从1开始")
+    page_size: Optional[int] = Field(default=10, ge=1, le=100, description="每页数量，最大100")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "zip_datafile_id": 1,
+                "file_name": "example.zip",
+                "user_id": 1,
+                "page": 1,
+                "page_size": 10
+            }
+        }
+
+
+class S3PresignedUploadResponse(StrictModel):
+    upload_url: str
+    s3_key: str
+    download_url: str
 
 # ---------- 用户权限查询 ----------
 class UserPermissionsQuery(StrictModel):

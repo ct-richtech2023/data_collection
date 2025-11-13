@@ -193,3 +193,16 @@ class OperationLog(Base):
                          onupdate=func.now(), nullable=False)
 
 
+class ZipDataFile(Base):
+    """ZIP数据文件表"""
+    __tablename__ = "zip_data_file"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_name = Column(Text, nullable=False)  # 文件名称（如 .zip 文件）
+    file_size = Column(BigInteger, nullable=False)  # 文件大小
+    download_number = Column(Integer, nullable=False)  # 下载次数  默认为0
+    download_url = Column(Text, nullable=False)  # 下载地址
+    user_id = Column(Integer, nullable=False, index=True)
+    create_time = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    update_time = Column(DateTime(timezone=True), server_default=func.now(),
+                         onupdate=func.now(), nullable=False)

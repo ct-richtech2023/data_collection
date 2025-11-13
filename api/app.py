@@ -12,6 +12,7 @@ from router.operation import router as operation_router
 from router.task import router as task_router
 from router.label import router as label_router
 from router.datafile import router as datafile_router
+from router.zipdatafile import router as zipdatafile_router
 from router.operationlog import router as operationlog_router
 from static import SwaggerUIFileNames, SwaggerUIFiles
 
@@ -53,6 +54,7 @@ app.mount('/uploads', StaticFiles(directory='uploads'), name='uploads')
 app.mount('/tmp/data_collection', StaticFiles(directory='/tmp/data_collection'), name='temp_downloads')
 
 # 挂载API
+app.include_router(zipdatafile_router)
 app.include_router(datafile_router)
 app.include_router(task_router)
 app.include_router(label_router)
