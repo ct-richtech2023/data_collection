@@ -10,7 +10,7 @@ from common.database import get_db
 from common import models, schemas
 from common.operation_log_util import OperationLogUtil
 from router.user.auth import get_current_user
-from router.datafile.datafile import get_s3_client, build_s3_url, S3_BUCKET_NAME
+from router.datafile.datafile import get_s3_client, build_s3_url, S3_BUCKET_NAME, parse_s3_url
 from loguru import logger
 
 router = APIRouter()
@@ -194,6 +194,93 @@ def upload_zip(
         )
 
 
+@router.post("/update_zip_file_name_by_zip_datafile_id", response_model=schemas.ZipDataFileOut)
+def update_zip_file_name(
+    zip_datafile_id: int,
+    file_name: str,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db),
+):
+    """
+    更新 ZIP 文件名称
+    """
+    try:
+        # 验证token并获取当前用户
+        current_user = get_current_user(token, db)
+        
+        # 权限检查：检查更新操作权限
+        if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "update"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="您没有ZIP文件更新权限"
+            )
+        
+        logger.info(
+            f"[Update ZIP] 更新文件名称请求 | user_id={current_user.id} "
+            f"zip_datafile_id={zip_datafile_id} file_name={file_name}"
+        )
+        
+        # 更新ZIP文件名称
+        zip_datafile = db.query(models.ZipDataFile).filter(
+            models.ZipDataFile.id == zip_datafile_id
+        ).first()
+        if not zip_datafile:
+            logger.warning(
+                f"[Update ZIP] ZIP文件不存在 | user_id={current_user.id} "
+                f"zip_datafile_id={zip_datafile_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="ZIP文件不存在"
+            )
+        
+        zip_datafile.file_name = file_name
+        try:
+            db.commit()
+            db.refresh(zip_datafile)
+        except Exception as e:
+            logger.error(f"[Update ZIP] 更新文件名称失败: {e}")
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="更新文件名称失败，请稍后重试")
+
+        logger.info(
+            f"[Update ZIP] 文件名称更新成功 | zip_datafile_id={zip_datafile_id} "
+            f"user_id={current_user.id}"
+        )
+
+        # 记录操作日志：更新ZIP文件名称
+        try:
+            OperationLogUtil.create_log(
+                db=db,
+                username=current_user.username,
+                action="ZIP File Update",
+                content=f"User {current_user.username} updated ZIP file name {file_name} (zip_datafile_id: {zip_datafile_id})"
+            )
+        except Exception as e:
+            # 操作日志记录失败不影响主流程，只记录警告
+            logger.warning(f"[Update ZIP] 记录操作日志失败: {e}")
+
+        return schemas.ZipDataFileOut(
+            id=zip_datafile.id,
+            file_name=zip_datafile.file_name,
+            file_size=zip_datafile.file_size,
+            download_number=zip_datafile.download_number,
+            download_url=zip_datafile.download_url,
+            user_id=zip_datafile.user_id,
+            create_time=zip_datafile.create_time,
+            update_time=zip_datafile.update_time,
+        )
+    except HTTPException:
+        # 已经构造好的 HTTPException 直接抛出
+        raise
+    except Exception as e:
+        logger.exception(f"[Update ZIP] 未知异常: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="更新文件名称失败，请稍后重试",
+        )
+
+
 @router.post("/save_zip_file", response_model=schemas.ZipDataFileOut)
 def save_zip_file(
     zip_datafile: schemas.ZipDataFileCreate,
@@ -297,8 +384,13 @@ def save_zip_file(
         )
 
         db.add(db_zip_datafile)
-        db.commit()
-        db.refresh(db_zip_datafile)
+        try:
+            db.commit()
+            db.refresh(db_zip_datafile)
+        except Exception as e:
+            logger.error(f"[Save ZIP] 保存文件信息失败: {e}")
+            db.rollback()
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="保存文件信息失败，请稍后重试")
 
         logger.info(
             f"[Save ZIP] 文件信息保存成功 | zip_datafile_id={db_zip_datafile.id} "
@@ -339,12 +431,165 @@ def save_zip_file(
             detail="保存文件信息失败，请稍后重试",
         )
 
-@router.post("/add_download_number_by_zip_datafile_id")
-def add_download_number_by_zip_datafile_id(
+
+@router.post("/get_download_url_by_zip_datafile_id")
+def get_download_url_by_zip_datafile_id(
     zip_datafile_id: int,
     token: str = Header(..., description="JWT token"),
     db: Session = Depends(get_db),
 ):
+    """
+    获取ZIP文件的S3预签名下载URL
+    
+    流程：
+    1. 验证用户身份和下载权限
+    2. 查找ZIP文件记录
+    3. 解析S3 URL获取bucket和key
+    4. 生成预签名下载URL
+    5. 增加下载次数
+    6. 记录操作日志
+    
+    返回：
+    - download_url: S3预签名下载URL（前端可直接使用此URL下载文件）
+    - expires_in: URL有效期（秒）
+    """
+    try:
+        # 验证token并获取当前用户
+        current_user = get_current_user(token, db)
+        
+        # 权限检查：检查下载操作权限
+        if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "download"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="您没有ZIP文件下载权限"
+            )
+
+        logger.info(
+            f"[Download ZIP] 获取下载URL请求 | user_id={current_user.id} "
+            f"zip_datafile_id={zip_datafile_id}"
+        )
+
+        # 查找ZIP文件
+        zip_datafile = db.query(models.ZipDataFile).filter(
+            models.ZipDataFile.id == zip_datafile_id
+        ).first()
+        if not zip_datafile:
+            logger.warning(
+                f"[Download ZIP] ZIP文件不存在 | user_id={current_user.id} "
+                f"zip_datafile_id={zip_datafile_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="ZIP文件不存在"
+            )
+
+        # 解析S3 URL
+        try:
+            bucket, key = parse_s3_url(zip_datafile.download_url)
+        except ValueError as e:
+            logger.error(
+                f"[Download ZIP] S3 URL解析失败 | user_id={current_user.id} "
+                f"zip_datafile_id={zip_datafile_id} download_url={zip_datafile.download_url} error={e}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"无效的S3 URL格式: {zip_datafile.download_url}"
+            )
+
+        # 获取S3客户端
+        s3 = get_s3_client()
+
+        # 生成预签名下载URL
+        try:
+            presigned_download_url = s3.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": bucket,
+                    "Key": key,
+                },
+                ExpiresIn=PRESIGNED_URL_EXPIRES_IN,
+            )
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code")
+            logger.error(
+                f"[Download ZIP] 生成预签名URL失败 | user_id={current_user.id} "
+                f"zip_datafile_id={zip_datafile_id} bucket={bucket} key={key} "
+                f"error_code={error_code} error={e}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="生成下载URL失败，请稍后重试",
+            )
+        except Exception as e:
+            logger.exception(f"[Download ZIP] 生成预签名URL异常 | user_id={current_user.id} error={e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="生成下载URL失败，请稍后重试",
+            )
+
+        # 增加下载次数
+        old_download_number = zip_datafile.download_number
+        zip_datafile.download_number += 1
+        
+        try:
+            db.commit()
+            db.refresh(zip_datafile)
+        except Exception as e:
+            logger.error(
+                f"[Download ZIP] 更新下载次数失败 | user_id={current_user.id} "
+                f"zip_datafile_id={zip_datafile_id} error={e}"
+            )
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="更新下载次数失败，请稍后重试"
+            )
+
+        logger.info(
+            f"[Download ZIP] 预签名URL生成成功 | user_id={current_user.id} "
+            f"zip_datafile_id={zip_datafile_id} filename={zip_datafile.file_name} "
+            f"download_number: {old_download_number} -> {zip_datafile.download_number} "
+            f"expires_in={PRESIGNED_URL_EXPIRES_IN}s"
+        )
+
+        # 记录操作日志：ZIP文件下载
+        try:
+            OperationLogUtil.create_log(
+                db=db,
+                username=current_user.username,
+                action="ZIP File Download",
+                content=f"User {current_user.username} requested download URL for ZIP file {zip_datafile.file_name} (zip_datafile_id: {zip_datafile_id}, download_number: {zip_datafile.download_number})"
+            )
+        except Exception as e:
+            # 操作日志记录失败不影响主流程，只记录警告
+            logger.warning(f"[Download ZIP] 记录操作日志失败: {e}")
+
+        return {
+            "download_url": presigned_download_url,
+            "expires_in": PRESIGNED_URL_EXPIRES_IN,
+            "file_name": zip_datafile.file_name,
+            "file_size": zip_datafile.file_size,
+            "zip_datafile_id": zip_datafile_id,
+        }
+
+    except HTTPException:
+        # 已经构造好的 HTTPException 直接抛出
+        raise
+    except Exception as e:
+        logger.exception(f"[Download ZIP] 未知异常: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="获取下载URL失败，请稍后重试"
+        )
+
+
+
+# @router.post("/add_download_number_by_zip_datafile_id")
+# def add_download_number_by_zip_datafile_id(
+#     zip_datafile_id: int,
+#     token: str = Header(..., description="JWT token"),
+#     db: Session = Depends(get_db),
+# ):
     """
     增加ZIP文件下载次数
     
@@ -392,15 +637,9 @@ def add_download_number_by_zip_datafile_id(
             db.commit()
             db.refresh(zip_datafile)
         except Exception as e:
-            logger.error(
-                f"[Download ZIP] 数据库提交失败 | user_id={current_user.id} "
-                f"zip_datafile_id={zip_datafile_id} error={e}"
-            )
+            logger.error(f"[Download ZIP] 更新下载次数失败: {e}")
             db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="更新下载次数失败，请稍后重试"
-            )
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="更新下载次数失败，请稍后重试")
 
         logger.info(
             f"[Download ZIP] 下载次数更新成功 | user_id={current_user.id} "
