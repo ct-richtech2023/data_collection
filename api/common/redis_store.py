@@ -242,6 +242,78 @@ class RedisStore:
         except Exception as e:
             logger.error(f"获取 Redis 统计信息失败: {e}")
             return {}
+    
+    def acquire_lock(self, lock_key: str, lock_value: str, expire_seconds: int) -> bool:
+        """获取分布式锁（使用 SET NX EX）
+        
+        Args:
+            lock_key: 锁的键名
+            lock_value: 锁的值（用于标识持有锁的worker）
+            expire_seconds: 锁的过期时间（秒），防止死锁
+        
+        Returns:
+            是否成功获取锁
+        """
+        try:
+            # SET key value NX EX seconds
+            # NX: 只在键不存在时设置
+            # EX: 设置过期时间（秒）
+            result = self.redis_client.set(lock_key, lock_value, nx=True, ex=expire_seconds)
+            return result is True
+        except Exception as e:
+            logger.error(f"获取分布式锁失败 | lock_key={lock_key} error={e}")
+            return False
+    
+    def release_lock(self, lock_key: str, lock_value: str) -> bool:
+        """释放分布式锁（使用 Lua 脚本确保原子性）
+        
+        Args:
+            lock_key: 锁的键名
+            lock_value: 锁的值（只有持有锁的worker才能释放）
+        
+        Returns:
+            是否成功释放锁
+        """
+        try:
+            # 使用 Lua 脚本确保原子性：只有锁的值匹配时才删除
+            lua_script = """
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+            else
+                return 0
+            end
+            """
+            result = self.redis_client.eval(lua_script, 1, lock_key, lock_value)
+            return result == 1
+        except Exception as e:
+            logger.error(f"释放分布式锁失败 | lock_key={lock_key} error={e}")
+            return False
+    
+    def extend_lock(self, lock_key: str, lock_value: str, expire_seconds: int) -> bool:
+        """延长锁的过期时间（使用 Lua 脚本确保原子性）
+        
+        Args:
+            lock_key: 锁的键名
+            lock_value: 锁的值（只有持有锁的worker才能延长）
+            expire_seconds: 新的过期时间（秒）
+        
+        Returns:
+            是否成功延长锁
+        """
+        try:
+            # 使用 Lua 脚本确保原子性：只有锁的值匹配时才延长
+            lua_script = """
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("expire", KEYS[1], ARGV[2])
+            else
+                return 0
+            end
+            """
+            result = self.redis_client.eval(lua_script, 1, lock_key, lock_value, expire_seconds)
+            return result == 1
+        except Exception as e:
+            logger.error(f"延长分布式锁失败 | lock_key={lock_key} error={e}")
+            return False
 
 # 全局 Redis 实例（延迟初始化）
 _redis_store: Optional[RedisStore] = None
