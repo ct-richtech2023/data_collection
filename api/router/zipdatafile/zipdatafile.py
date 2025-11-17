@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
+from typing import List, Dict, Any
 import os
 import uuid
 import re
@@ -17,8 +18,13 @@ router = APIRouter()
 
 # 配置常量
 S3_KEY_PREFIX = "zipfiles/"
-PRESIGNED_URL_EXPIRES_IN = 3600  # 预签名URL有效期：1小时
+PRESIGNED_URL_EXPIRES_IN = 3600*6  # 预签名URL有效期：6小时
 ALLOWED_FILE_EXTENSIONS = {".zip"}
+# 大文件分片上传配置
+# MULTIPART_THRESHOLD = 200 * 1024 * 1024  # 200MB，超过此大小使用分片上传，单位：bytes
+MULTIPART_THRESHOLD = 5 * 1024 * 1024 * 1024 # 5GB，超过此大小使用分片上传，单位：bytes
+MULTIPART_PART_SIZE = 100 * 1024 * 1024  # 100MB 每个分片大小，单位：bytes
+MAX_MULTIPART_PARTS = 10000  # S3最大分片数限制，每个分片最大为100MB
 
 
 def _validate_file_name(file_name: str) -> None:
@@ -102,6 +108,8 @@ def upload_zip(
     注意：
     - URL 有效期：{PRESIGNED_URL_EXPIRES_IN} 秒
     - 只支持 .zip 文件
+    - 文件大小 >= 5GB 时自动使用分片上传（multipart upload）
+    - 文件大小 < 5GB 时使用单次上传（put_object）
     """
     try:
         # 验证token并获取当前用户
@@ -114,11 +122,6 @@ def upload_zip(
                 detail="您没有ZIP文件上传权限"
             )
 
-        logger.info(
-            f"[Upload ZIP] 获取 S3 上传 URL | user_id={current_user.id} "
-            f"filename={request.file_name}"
-        )
-
         # 验证文件名安全性
         _validate_file_name(request.file_name)
 
@@ -129,59 +132,159 @@ def upload_zip(
         # 获取 S3 客户端
         s3 = get_s3_client()
 
-        # 生成预签名上传 URL
-        try:
-            presigned_url = s3.generate_presigned_url(
-                "put_object",
-                Params={
-                    "Bucket": S3_BUCKET_NAME,
-                    "Key": unique_key,
-                    "ContentType": "application/zip",
-                },
-                ExpiresIn=PRESIGNED_URL_EXPIRES_IN,
+        # 判断是否需要使用分片上传
+        use_multipart = request.file_size is not None and request.file_size >= MULTIPART_THRESHOLD
+        
+        if use_multipart:
+            # 大文件：使用分片上传（multipart upload）
+            logger.info(
+                f"[Upload ZIP] 使用分片上传 | user_id={current_user.id} "
+                f"filename={request.file_name} size={request.file_size} bytes"
             )
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code")
-            logger.error(
-                f"[Upload ZIP] S3 客户端错误 | user_id={current_user.id} "
-                f"error_code={error_code} error={e}"
+            
+            # 计算分片数量
+            total_parts = (request.file_size + MULTIPART_PART_SIZE - 1) // MULTIPART_PART_SIZE
+            
+            if total_parts > MAX_MULTIPART_PARTS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"文件太大，分片数量 {total_parts} 超过最大限制 {MAX_MULTIPART_PARTS}。请减小文件大小或增加分片大小。"
+                )
+            
+            try:
+                # 创建 multipart upload
+                multipart_response = s3.create_multipart_upload(
+                    Bucket=S3_BUCKET_NAME,
+                    Key=unique_key,
+                    ContentType="application/zip"
+                )
+                upload_id = multipart_response["UploadId"]
+                
+                # 为每个分片生成预签名URL
+                parts = []
+                for part_number in range(1, total_parts + 1):
+                    presigned_url = s3.generate_presigned_url(
+                        "upload_part",
+                        Params={
+                            "Bucket": S3_BUCKET_NAME,
+                            "Key": unique_key,
+                            "UploadId": upload_id,
+                            "PartNumber": part_number,
+                        },
+                        ExpiresIn=PRESIGNED_URL_EXPIRES_IN,
+                    )
+                    parts.append(schemas.S3PresignedUploadPart(
+                        part_number=part_number,
+                        upload_url=presigned_url
+                    ))
+                
+                logger.info(
+                    f"[Upload ZIP] Multipart上传URL生成成功 | key={unique_key} "
+                    f"upload_id={upload_id} total_parts={total_parts} "
+                    f"user_id={current_user.id} expires_in={PRESIGNED_URL_EXPIRES_IN}s"
+                )
+                
+                # 构建下载 URL
+                download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+                
+                # 记录操作日志
+                try:
+                    OperationLogUtil.create_log(
+                        db=db,
+                        username=current_user.username,
+                        action="ZIP File Upload (Multipart)",
+                        content=f"User {current_user.username} requested to upload ZIP file {request.file_name} (size: {request.file_size} bytes, parts: {total_parts}), S3 key: {unique_key}, upload_id: {upload_id}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Upload ZIP] 记录操作日志失败: {e}")
+                
+                return schemas.S3PresignedUploadResponse(
+                    upload_url=None,  # 分片上传不使用单次上传URL
+                    s3_key=unique_key,
+                    download_url=download_url,
+                    upload_id=upload_id,
+                    parts=parts,
+                    part_size=MULTIPART_PART_SIZE
+                )
+                
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code")
+                logger.error(
+                    f"[Upload ZIP] S3 Multipart上传错误 | user_id={current_user.id} "
+                    f"error_code={error_code} error={e}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="生成 S3 分片上传 URL 失败，请稍后重试",
+                )
+            except Exception as e:
+                logger.exception(f"[Upload ZIP] 生成Multipart URL异常 | user_id={current_user.id} error={e}")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="生成 S3 分片上传 URL 失败，请稍后重试",
+                )
+        else:
+            # 小文件：使用单次上传（put_object）
+            logger.info(
+                f"[Upload ZIP] 使用单次上传 | user_id={current_user.id} "
+                f"filename={request.file_name} size={request.file_size if request.file_size else 'unknown'}"
             )
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="生成 S3 预签名 URL 失败，请稍后重试",
-            )
-        except Exception as e:
-            logger.exception(f"[Upload ZIP] 生成预签名URL异常 | user_id={current_user.id} error={e}")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="生成 S3 预签名 URL 失败，请稍后重试",
+            
+            try:
+                presigned_url = s3.generate_presigned_url(
+                    "put_object",
+                    Params={
+                        "Bucket": S3_BUCKET_NAME,
+                        "Key": unique_key,
+                        "ContentType": "application/zip",
+                    },
+                    ExpiresIn=PRESIGNED_URL_EXPIRES_IN,
+                )
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code")
+                logger.error(
+                    f"[Upload ZIP] S3 客户端错误 | user_id={current_user.id} "
+                    f"error_code={error_code} error={e}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="生成 S3 预签名 URL 失败，请稍后重试",
+                )
+            except Exception as e:
+                logger.exception(f"[Upload ZIP] 生成预签名URL异常 | user_id={current_user.id} error={e}")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="生成 S3 预签名 URL 失败，请稍后重试",
+                )
+
+            # 构建下载 URL
+            download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+
+            logger.info(
+                f"[Upload ZIP] S3 预签名 URL 生成成功 | key={unique_key} "
+                f"user_id={current_user.id} expires_in={PRESIGNED_URL_EXPIRES_IN}s"
             )
 
-        # 构建下载 URL
-        download_url = build_s3_url(S3_BUCKET_NAME, unique_key)
+            # 记录操作日志：请求上传 ZIP 文件
+            try:
+                OperationLogUtil.create_log(
+                    db=db,
+                    username=current_user.username,
+                    action="ZIP File Upload",
+                    content=f"User {current_user.username} requested to upload ZIP file {request.file_name}, S3 key: {unique_key}"
+                )
+            except Exception as e:
+                # 操作日志记录失败不影响主流程，只记录警告
+                logger.warning(f"[Upload ZIP] 记录操作日志失败: {e}")
 
-        logger.info(
-            f"[Upload ZIP] S3 预签名 URL 生成成功 | key={unique_key} "
-            f"user_id={current_user.id} expires_in={PRESIGNED_URL_EXPIRES_IN}s"
-        )
-
-        # 记录操作日志：请求上传 ZIP 文件
-        try:
-            OperationLogUtil.create_log(
-                db=db,
-                username=current_user.username,
-                action="ZIP File Upload",
-                content=f"User {current_user.username} requested to upload ZIP file {request.file_name}, S3 key: {unique_key}"
+            return schemas.S3PresignedUploadResponse(
+                upload_url=presigned_url,
+                s3_key=unique_key,
+                download_url=download_url,
+                upload_id=None,
+                parts=None,
+                part_size=None
             )
-        except Exception as e:
-            # 操作日志记录失败不影响主流程，只记录警告
-            logger.warning(f"[Upload ZIP] 记录操作日志失败: {e}")
-
-        return schemas.S3PresignedUploadResponse(
-            upload_url=presigned_url,
-            s3_key=unique_key,
-            download_url=download_url,
-        )
 
     except HTTPException:
         # 已经构造好的 HTTPException 直接抛出
@@ -191,6 +294,124 @@ def upload_zip(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="生成 S3 上传 URL 失败，请稍后重试",
+        )
+
+
+@router.post("/complete_multipart_upload")
+def complete_multipart_upload(
+    request: schemas.CompleteMultipartUploadRequest,
+    token: str = Header(..., description="JWT token"),
+    db: Session = Depends(get_db)
+):
+    """
+    完成 S3 分片上传
+    前端上传完所有分片后，需要调用此接口完成multipart upload
+    
+    Args:
+        s3_key: S3对象键
+        upload_id: Multipart Upload ID
+        parts: 分片信息列表，每个元素包含 {"PartNumber": int, "ETag": str}
+    
+    注意：
+    - 前端需要从每个分片的上传响应中获取ETag
+    - ETag是每个分片上传成功后返回的标识符
+    """
+    try:
+        # 验证token并获取当前用户
+        current_user = get_current_user(token, db)
+        
+        # 权限检查
+        if not PermissionUtils.check_operation_permission(db, current_user.id, "data", "upload"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="您没有ZIP文件上传权限"
+            )
+        
+        # 验证S3 key
+        _validate_s3_key(request.s3_key)
+        
+        logger.info(
+            f"[Complete Multipart] 完成分片上传 | user_id={current_user.id} "
+            f"s3_key={request.s3_key} upload_id={request.upload_id} parts_count={len(request.parts)}"
+        )
+        
+        # 获取 S3 客户端
+        s3 = get_s3_client()
+        
+        # 构建分片列表（需要包含PartNumber和ETag）
+        multipart_parts = []
+        for part in request.parts:
+            if "PartNumber" not in part or "ETag" not in part:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="分片信息格式错误，每个分片必须包含 PartNumber 和 ETag"
+                )
+            multipart_parts.append({
+                "PartNumber": int(part["PartNumber"]),
+                "ETag": part["ETag"]
+            })
+        
+        # 按PartNumber排序
+        multipart_parts.sort(key=lambda x: x["PartNumber"])
+        
+        try:
+            # 完成multipart upload
+            response = s3.complete_multipart_upload(
+                Bucket=S3_BUCKET_NAME,
+                Key=request.s3_key,
+                UploadId=request.upload_id,
+                MultipartUpload={"Parts": multipart_parts}
+            )
+            
+            logger.info(
+                f"[Complete Multipart] 分片上传完成 | user_id={current_user.id} "
+                f"s3_key={request.s3_key} upload_id={request.upload_id} etag={response.get('ETag')}"
+            )
+            
+            return {
+                "success": True,
+                "message": "分片上传完成",
+                "s3_key": request.s3_key,
+                "etag": response.get("ETag")
+            }
+            
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code")
+            logger.error(
+                f"[Complete Multipart] S3错误 | user_id={current_user.id} "
+                f"error_code={error_code} error={e}"
+            )
+            
+            # 如果是无效的分片，尝试取消multipart upload
+            if error_code in ["InvalidPart", "InvalidPartOrder"]:
+                try:
+                    s3.abort_multipart_upload(
+                        Bucket=S3_BUCKET_NAME,
+                        Key=request.s3_key,
+                        UploadId=request.upload_id
+                    )
+                    logger.info(f"[Complete Multipart] 已取消无效的分片上传 | upload_id={request.upload_id}")
+                except Exception as abort_error:
+                    logger.warning(f"[Complete Multipart] 取消分片上传失败: {abort_error}")
+            
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"完成分片上传失败: {error_code}",
+            )
+        except Exception as e:
+            logger.exception(f"[Complete Multipart] 完成分片上传异常 | user_id={current_user.id} error={e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="完成分片上传失败，请稍后重试",
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[Complete Multipart] 未知异常: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="完成分片上传失败，请稍后重试",
         )
 
 

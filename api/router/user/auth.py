@@ -7,7 +7,7 @@ from api.common import models
 
 SECRET_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 6  # 6小时过期
 
 pwd_context = CryptContext(
     schemes=["bcrypt_sha256", "bcrypt"],  # 兼容长口令，保留旧 bcrypt

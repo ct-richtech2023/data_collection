@@ -453,6 +453,7 @@ class UserPermissionsCreate(StrictModel):
 # ---------- ZIP数据文件管理 ----------
 class ZipUploadRequest(StrictModel):
     file_name: str
+    file_size: Optional[int] = Field(default=None, description="文件大小（bytes），用于大文件分片上传")
 
 
 class ZipDataFileCreate(StrictModel):
@@ -491,10 +492,28 @@ class ZipDataFileQuery(StrictModel):
         }
 
 
+class S3PresignedUploadPart(StrictModel):
+    """S3分片上传信息"""
+    part_number: int = Field(description="分片编号（从1开始）")
+    upload_url: str = Field(description="该分片的预签名上传URL")
+
+
 class S3PresignedUploadResponse(StrictModel):
-    upload_url: str
-    s3_key: str
-    download_url: str
+    """S3预签名上传响应"""
+    upload_url: Optional[str] = Field(default=None, description="单次上传URL（文件小于5GB时使用）")
+    s3_key: str = Field(description="S3对象键")
+    download_url: str = Field(description="下载URL")
+    # 分片上传相关字段（文件大于等于5GB时使用）
+    upload_id: Optional[str] = Field(default=None, description="Multipart Upload ID")
+    parts: Optional[List[S3PresignedUploadPart]] = Field(default=None, description="分片上传URL列表")
+    part_size: Optional[int] = Field(default=None, description="每个分片的大小（字节）")
+
+
+class CompleteMultipartUploadRequest(StrictModel):
+    """完成分片上传请求"""
+    s3_key: str = Field(description="S3对象键")
+    upload_id: str = Field(description="Multipart Upload ID")
+    parts: List[Dict[str, Any]] = Field(description="分片信息列表，每个元素包含 PartNumber 和 ETag")
 
 # ---------- 用户权限查询 ----------
 class UserPermissionsQuery(StrictModel):
